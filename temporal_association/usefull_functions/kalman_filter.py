@@ -23,7 +23,8 @@ def apply_kalman_filter(data):
     filtered = [(previous_t, X.copy())]
 
     for t, px, py in data[1:]:
-        X, P = kalman(X, P, [px, py], t-previous_t, R, q)
+        measurement = ([px, py] if np.isfinite(px) and np.isfinite(py) else None)
+        X, P = kalman(X, P, measurement, t - previous_t, R, q)
         filtered.append((t, X.copy()))
         previous_t = t
 
