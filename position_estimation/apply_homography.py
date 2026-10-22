@@ -24,7 +24,7 @@ def apply_homography(H):
             y_world = transform_point[0][0][1]
 
             #retirer points hors du terrain
-            if not (0.5 <= x_world <= 9.5 and 0 <= y_world <= 19.5):
+            if not (0 <= x_world <= 10 and 0 <= y_world <= 20):
                     continue
 
             #enregistrer la position
