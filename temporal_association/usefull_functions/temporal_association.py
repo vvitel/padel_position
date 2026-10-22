@@ -4,8 +4,8 @@ from scipy.spatial.distance import cdist
 
 def temporal_association(data, seq_keep, window_size):
     #séparer terrain du haut et du bas
-    data_up = data[data[:, 2] < 10]
-    data_down = data[data[:, 2] > 10]
+    data_up = data[data[:, 2] < 9.7]
+    data_down = data[data[:, 2] > 10.3]
     cpt_semi_court = 0
 
     lst_final_temporal = []
