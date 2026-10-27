@@ -19,14 +19,14 @@ start, end = args.frame_start, args.frame_end
 step = args.frame_step
 
 #détection du court
-#subprocess.run(f"python ./padel-court-detector/detect_court.py {video_path}", shell=True)
+subprocess.run(f"python ./padel-court-detector/detect_court.py {video_path}", shell=True)
 
 #détection des joueurs
-#model, k, f, cx, cy, H = get_camera_parameters()
-#detect_players(video_path, start, end, step, model, k, f, cx, cy)
+model, k, f, cx, cy, H = get_camera_parameters()
+detect_players(video_path, start, end, step, model, k, f, cx, cy)
 
 #appliquer l'homographie
-#apply_homography(H)
+apply_homography(H)
 
 #connecter les joueurs
 data, seq_keep = connect_players()
