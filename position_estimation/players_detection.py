@@ -7,6 +7,7 @@ from position_estimation.camera_functions.undistort_points import undistort_poin
 def detect_players(video_path, start, end, step, model, k, f, cx, cy):
     #chargement du modèles
     model_box = YOLO("yolo26m.pt")
+    model_pose = YOLO("yolo26m-pose.pt")
 
     #lecture de la vidéo
     cap = cv2.VideoCapture(video_path)
@@ -45,8 +46,12 @@ def detect_players(video_path, start, end, step, model, k, f, cx, cy):
 
                     #si la box atteint le bas de l'image
                     if bottom_center_y >= frame.shape[0] - 2:
-                        height = (x2 - x1) / 0.4
-                        bottom_center_y = y1 + height
+                        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+                        crop = frame[y1:y2, x1:x2]
+                        result_pose = model_pose.predict(source=crop, imgsz=960, show=False, verbose=False, classes=[0])
+                        keypoints = result_pose[0].keypoints.data
+                        if len(keypoints) == 0: continue
+                        
 
                     #retirer la distortion
                     point_undistorted = undistort_points(
