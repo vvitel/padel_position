@@ -23,7 +23,7 @@ subprocess.run(f"python ./padel-court-detector/detect_court.py {video_path}", sh
 
 #détection des joueurs
 model, k, f, cx, cy, H = get_camera_parameters()
-detect_players(video_path, start, end, step, model, k, f, cx, cy)
+detect_players(video_path, start, end, step, model, k, f, cx, cy, H)
 
 #appliquer l'homographie
 apply_homography(H)
