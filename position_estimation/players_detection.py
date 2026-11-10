@@ -56,7 +56,7 @@ def detect_players(video_path, start, end, step, model, k, f, cx, cy, H):
                         left_ankle, right_ankle = keypoints[0][15], keypoints[0][16]
                         x_left_ankle, y_left_ankle = left_ankle[:2]
                         x_right_ankle, y_right_ankle = right_ankle[:2]
-                        if (x_left_ankle != 0) or (y_left_ankle == 0) or (x_right_ankle != 0) or (y_right_ankle != 0):
+                        if (x_left_ankle != 0) or (y_left_ankle != 0) or (x_right_ankle != 0) or (y_right_ankle != 0):
                             point_undistorted = undistort_points([[bottom_center_x, bottom_center_y]], cam)
                             dic_pos_frame[cpt] = {"id": track_id, "position": point_undistorted[0].tolist()}
                             cpt += 1
@@ -66,11 +66,14 @@ def detect_players(video_path, start, end, step, model, k, f, cx, cy, H):
                             nose = keypoints[0][0]
                             x_nose, y_nose = nose[:2]
                             if (x_nose == 0) and (y_nose == 0): continue
+                            #repasser des coordonnées du crop à celles de l'image
+                            x_nose, y_nose = float(x_nose) + x1, float(y_nose) + y1
                             nose_undistorted = undistort_points([[x_nose, y_nose]], cam)
                             x_nose_undistorted, y_nose_undistorted = nose_undistorted[0]
-                            #estimer position des pieds
-                            x_foot_estimated, y_foot_estimated = find_foot_with_nose(x_nose_undistorted, y_nose_undistorted, H, f, cx, cy, 1.75)
-                            estimated_point = [x_foot_estimated, y_foot_estimated]
+                            #estimer position des pieds (en pixels non distordus)
+                            foot = find_foot_with_nose(x_nose_undistorted, y_nose_undistorted, H, f, cx, cy, 1.75)
+                            if foot is None: continue
+                            estimated_point = list(foot)
                             dic_pos_frame[cpt] = {"id": track_id,
                                                 "position": estimated_point}
                             cpt += 1
