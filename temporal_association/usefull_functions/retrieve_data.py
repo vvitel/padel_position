@@ -1,8 +1,8 @@
 import json
 import numpy as np
 
-def retrieve_data():
-    with open("data_homography.json", "r") as f:
+def retrieve_data(path="data_homography.json"):
+    with open(path, "r") as f:
         dico = json.load(f)
 
     array = []

@@ -1,12 +1,13 @@
+import os
 import cv2
 import json
 import numpy as np
 
-def apply_homography(H):
+def apply_homography(H, out_dir="."):
     H = np.linalg.inv(H)
 
     #ouvrir les données
-    with open("data_pose.json", "r") as fp:
+    with open(os.path.join(out_dir, "data_pose.json"), "r") as fp:
         dico = json.load(fp)
 
     #transformer les points
@@ -33,5 +34,5 @@ def apply_homography(H):
         dico_match[frame] = lst_frame
 
     #enregistrement
-    with open("data_homography.json", "w") as fp:
+    with open(os.path.join(out_dir, "data_homography.json"), "w") as fp:
         json.dump(dico_match, fp)

@@ -1,8 +1,8 @@
 import json
 import numpy as np
 
-def get_camera_parameters():
-    with open("calibration.json", "r") as fp:
+def get_camera_parameters(path="calibration.json"):
+    with open(path, "r") as fp:
         cam = json.load(fp)
 
     model = cam["lens"]["model"]

@@ -3,9 +3,9 @@ import numpy as np
 from temporal_association.usefull_functions.retrieve_data import retrieve_data
 from temporal_association.usefull_functions.identify_breaks import identify_breaks
 
-def connect_players():
+def connect_players(path="data_homography.json"):
     #lire les données
-    data = retrieve_data()
+    data = retrieve_data(path)
     start, stop = min(data[:, 0]), max(data[:, 0])
 
     #identifier les ruptures dans le tracking

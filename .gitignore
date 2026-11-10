@@ -226,3 +226,5 @@ __marimo__/
 *.png
 *.csv
 *.onnx
+*.engine
+outputs/
