@@ -31,8 +31,8 @@ def camera_pose_from_homography(H, f, cx, cy):
 
     return R, C
 
-def find_foot_with_nose(x_nose, y_nose, H, f, cx, cy, h):
-    R, C = camera_pose_from_homography(H, f, cx, cy)
+def find_foot_with_nose(x_nose, y_nose, R, C, H, f, cx, cy, h):
+    #R, C : pose de la caméra, calculée une seule fois avec camera_pose_from_homography
 
     #construire le rayon caméra passant par le nez
     ray = np.array([(x_nose-cx)/f, (y_nose-cy)/f, 1.0])

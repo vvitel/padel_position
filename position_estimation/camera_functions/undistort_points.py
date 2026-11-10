@@ -1,29 +1,17 @@
+import cv2
 import numpy as np
-from scipy.optimize import least_squares
-from position_estimation.camera_functions.distort import distort
+
+#critère d'arrêt de la résolution itérative d'OpenCV
+CRITERIA = (cv2.TERM_CRITERIA_COUNT + cv2.TERM_CRITERIA_EPS, 50, 1e-12)
 
 def undistort_points(points_px, cam):
-    points_px = np.asarray(points_px, dtype=float)
+    points_px = np.asarray(points_px, dtype=np.float64).reshape(-1, 1, 2)
 
-    xy_distorted = np.column_stack([
-        (points_px[:, 0] - cam["cx"]) / cam["f"],
-        (points_px[:, 1] - cam["cy"]) / cam["f"]
-    ])
+    K = np.array([[cam["f"], 0, cam["cx"]], [0, cam["f"], cam["cy"]], [0, 0, 1]], dtype=np.float64)
+    #modèle fisheye OpenCV : theta_d = theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)
+    D = np.array([cam["k"][0], cam["k"][1], 0.0, 0.0], dtype=np.float64)
 
-    points_ideal = []
+    #P=K pour retrouver des coordonnées en pixels (non distordus)
+    points_undistorted_px = cv2.fisheye.undistortPoints(points_px, K, D, P=K, criteria=CRITERIA)
 
-    for target in xy_distorted:
-        result = least_squares(
-            lambda xy: distort(
-                xy.reshape(1, 2), cam["k"])[0] - target, target
-        )
-        points_ideal.append(result.x)
-
-    points_ideal = np.asarray(points_ideal)
-
-    points_undistorted_px = np.column_stack([
-        points_ideal[:, 0] * cam["f"] + cam["cx"],
-        points_ideal[:, 1] * cam["f"] + cam["cy"]
-    ])
-
-    return points_undistorted_px
+    return points_undistorted_px.reshape(-1, 2)
