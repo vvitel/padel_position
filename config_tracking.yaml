@@ -1,0 +1,40 @@
+
+# padel_tracktrack.yaml
+# Padel - Fixed rear camera - 1080p - 30 FPS
+# Goal: stable IDs for 4 players
+
+tracker_type: tracktrack
+
+# Detection association
+track_high_thresh: 0.50
+track_low_thresh: 0.15
+new_track_thresh: 0.70
+
+# Lost track management
+track_buffer: 60
+lost_match_thr: 0.85
+
+# Matching
+match_thresh: 0.70
+
+# Association weights
+iou_weight: 0.50
+reid_weight: 0.50
+conf_weight: 0.10
+angle_weight: 0.05
+
+# Iterative assignment
+penalty_p: 0.20
+penalty_q: 0.40
+reduce_step: 0.05
+
+# Track initialization
+tai_thr: 0.55
+min_track_len: 3
+
+# Fixed camera
+gmc_method: none
+
+# Re-identification
+with_reid: true
+model: yolo26m-reid.onnx
