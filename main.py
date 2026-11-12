@@ -120,7 +120,7 @@ def prefetch_models(args):
     from position_estimation.players_detection import BOX_IMGSZ, TRACKER_CFG
     YOLO(args.pose_model, task="pose")
     YOLO(args.box_model, task="detect").track(np.zeros((BOX_IMGSZ, BOX_IMGSZ, 3), np.uint8), imgsz=BOX_IMGSZ,
-                                              tracker=TRACKER_CFG, verbose=False, half=args.half)
+                                              tracker=TRACKER_CFG, verbose=False, quantize=16 if args.half else None)
     if torch.cuda.is_available(): torch.cuda.empty_cache()
 
 
