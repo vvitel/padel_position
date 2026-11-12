@@ -1,44 +1,22 @@
 import numpy as np
 
 def identify_breaks(data):
+    #pour chaque id : première et dernière frame où il est vu
+    #retour : tableau ID | apparition | disparition
+    #apparition = -1 si l'id est déjà là à la première frame des données (pas une vraie apparition)
+    #disparition = -1 si l'id est encore là à la dernière frame des données (pas une vraie disparition)
+    if len(data) == 0: return np.empty((0, 3), dtype=int)
     start, stop = int(data[:, 0].min()), int(data[:, 0].max())
-    substr = data[(data[:, 0] >= start) & (data[:, 0] <= stop)]
 
-    #ids présents dès la première frame
-    first_frame_ids = np.unique(substr[substr[:, 0] == start, 1])
+    ids, inverse = np.unique(data[:, 1].astype(int), return_inverse=True)
+    frames = data[:, 0].astype(int)
+    first = np.full(len(ids), np.iinfo(int).max)
+    last = np.full(len(ids), np.iinfo(int).min)
+    np.minimum.at(first, inverse, frames)
+    np.maximum.at(last, inverse, frames)
 
-    lst_appearance = [(start, int(id_)) for id_ in first_frame_ids]
-    lst_disappearance = []
-
-    #identifier les ruptures dans le tracking
-    for j in range(start+1, stop):
-        prev_frame = np.sort(substr[substr[:, 0] == j-1, 1])
-        curr_frame = np.sort(substr[substr[:, 0] == j, 1])
-
-        appeared_ids = np.setdiff1d(curr_frame, prev_frame)
-        disappeared_ids = np.setdiff1d(prev_frame, curr_frame)
-
-        #première apparition
-        for id_ in appeared_ids:
-            first_frame = substr[substr[:, 1] == id_, 0].min()
-            if j == first_frame:
-                lst_appearance.append((j, int(id_)))
-
-        #dernière disparition
-        for id_ in disappeared_ids:
-            last_frame = substr[substr[:, 1] == id_, 0].max()
-            if j-1 == last_frame:
-                lst_disappearance.append((j-1, int(id_)))
-
-    #construire le tableau final : ID | apparition | disparition
-    all_ids = np.unique(substr[:, 1])
-    result = np.full((len(all_ids), 3), -1, dtype=int)
-    result[:, 0] = all_ids.astype(int)
-
-    for frame, id_ in lst_appearance:
-        result[result[:, 0] == id_, 1] = frame
-
-    for frame, id_ in lst_disappearance:
-        result[result[:, 0] == id_, 2] = frame
+    result = np.stack([ids, first, last], axis=1)
+    result[first == start, 1] = -1
+    result[last == stop, 2] = -1
 
     return result

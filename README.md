@@ -12,7 +12,8 @@ python -B main.py --video_path "./videos/**/*.mp4" --workers 2
 ```
 
 Résultats dans `outputs/<nom de la vidéo>/` (`--out_dir` pour changer) : `calibration.json`, `court.log`,
-`data_pose.json`, `data_homography.json`.
+`data_pose.json`, `data_homography.json`,
+`data_tracks.json` (même format que `data_homography.json`, avec les ids réassociés après les disparitions).
 
 | option | défaut | rôle |
 |---|---|---|

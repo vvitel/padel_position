@@ -1,69 +1,80 @@
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
-def get_chains(correspondence):
-    mapping = {int(a): int(b) for a, b in correspondence}
-    chains, used = [], set()
+#zones des portes (côtés du court au niveau du filet) : un joueur qui y disparaît sort du court
+DOOR_Y = (9.0, 11.0)
+DOOR_X = ((0.0, 1.0), (9.0, 10.0))
+NET_Y = 10.0
 
-    for a, _ in correspondence:
-        current = int(a)
-        if current in used:
-            continue
 
-        chain, local = [], set()
-        while current in mapping and current not in local:
-            chain.append(current)
-            used.add(current)
-            local.add(current)
-            current = mapping[current]
+def in_door_zone(x, y):
+    return DOOR_Y[0] <= y <= DOOR_Y[1] and any(a <= x <= b for a, b in DOOR_X)
 
-        if current not in local:
-            chain.append(current)
-            used.add(current)
 
-        chains.append(chain)
+def position_at(data, track_id, frame):
+    row = data[(data[:, 0] == frame) & (data[:, 1] == track_id)]
+    return row[0, 2], row[0, 3]
 
-    return chains
 
-def reassociation(data, life_of_ids):
-    #identifier les zones de disparition
-    lst_correspondence = []
-    for life in life_of_ids:
-        ids_disappears, frame_disappears = int(life[0]), int(life[2])
-        if frame_disappears == -1: continue
+def reassociation(data, life_of_ids, fps=30.0, max_gap_s=5.0, base_dist=1.0, max_speed=6.0, net_margin=0.5):
+    """Relie chaque piste qui disparaît à au plus une piste qui apparaît après elle.
 
-        subset_disappears = data[(data[:, 0] == frame_disappears) & (data[:, 1] == ids_disappears)]
-        x_disappears, y_disappears = subset_disappears[0, 2], subset_disappears[0, 3]
+    Une liaison fin(A) -> début(B) est possible si :
+      - B commence strictement après la fin de A (pas de chevauchement : deux joueurs visibles en même temps
+        ne peuvent pas être fusionnés)
+      - l'écart dt est inférieur à max_gap_s
+      - la distance est inférieure à base_dist + max_speed * dt (le rayon grandit avec le temps d'absence)
+      - A et B sont du même côté du filet (sauf si l'un des deux est à moins de net_margin du filet)
+      - A ne disparaît pas par une porte (le joueur sort du court)
+    Les liaisons sont choisies globalement et une à une (algorithme hongrois), sur la distance normalisée
+    par le rayon autorisé. Les liaisons successives forment des chaînes A -> B -> C.
 
-        #si disparition zone d'entrée du court
-        if 9 <= y_disappears <= 11 and (0 <= x_disappears <= 1 or 9 <= x_disappears <= 10):
-            continue
+    Retour : dict {ancien id: nouvel id} (le nouvel id est le premier id de la chaîne)
+    """
+    #fins et débuts de pistes avec leur position
+    ends = []
+    for track_id, _, frame_end in life_of_ids:
+        if frame_end == -1: continue
+        x, y = position_at(data, track_id, frame_end)
+        if in_door_zone(x, y): continue
+        ends.append((int(track_id), int(frame_end), x, y))
 
-        #si disparition dans le court
-        else:
-            candidates = life_of_ids[life_of_ids[:, 1] > frame_disappears - 30]
-            if len(candidates) > 0:
-                #on test 3 apparitions temporellement les plus proches et au dessus
-                closest_indices = np.argsort(np.abs(candidates[:, 1] - frame_disappears))[:3]
-                closest_appears = candidates[closest_indices]
+    starts = []
+    for track_id, frame_start, _ in life_of_ids:
+        if frame_start == -1: continue
+        x, y = position_at(data, track_id, frame_start)
+        starts.append((int(track_id), int(frame_start), x, y))
 
-                for appears in closest_appears:
-                    ids_appears, frame_appears = int(appears[0]), int(appears[1])
-                    subset_appears = data[(data[:, 0] == frame_appears) & (data[:, 1] == ids_appears)]
+    if not ends or not starts: return {}
 
-                    if len(subset_appears) > 0:
-                        x_appears, y_appears = subset_appears[0, 2], subset_appears[0, 3]
-                        distance = np.sqrt((x_disappears - x_appears)**2 + (y_disappears - y_appears)**2)
-                        if distance < 1.5:
-                            lst_correspondence.append((ids_disappears, ids_appears))
-                            break
+    #matrice des coûts
+    INF = 1e6
+    max_gap = max_gap_s * fps
+    cost = np.full((len(ends), len(starts)), INF)
+    for i, (id_a, f_a, x_a, y_a) in enumerate(ends):
+        for j, (id_b, f_b, x_b, y_b) in enumerate(starts):
+            dt = f_b - f_a
+            if id_a == id_b or dt <= 0 or dt > max_gap: continue
+            if abs(y_a - NET_Y) > net_margin and abs(y_b - NET_Y) > net_margin and (y_a < NET_Y) != (y_b < NET_Y):
+                continue
+            radius = base_dist + max_speed * dt / fps
+            dist = np.hypot(x_a - x_b, y_a - y_b)
+            if dist <= radius: cost[i, j] = dist / radius
 
-    #lier les ids malgré les disparitions
-    correspondence = np.array(lst_correspondence)
-    correspondence = correspondence[correspondence[:, 0] != correspondence[:, 1]]
-    chains  = get_chains(correspondence)
-    mapping = {id_: chain[0] for chain in chains for id_ in chain}
+    #affectation un pour un
+    rows, cols = linear_sum_assignment(cost)
+    successor = {ends[i][0]: starts[j][0] for i, j in zip(rows, cols) if cost[i, j] < INF}
 
-    #remplacer les ids dans data
-    data[:, 1] = np.array([mapping.get(int(id_), int(id_))for id_ in data[:, 1]])
+    #chaînes : chaque id a au plus un successeur et un prédécesseur, et chaque liaison va vers le futur
+    #donc pas de cycle ; la racine d'une chaîne est un id qui n'est le successeur de personne
+    has_predecessor = set(successor.values())
+    mapping = {}
+    for root in successor:
+        if root in has_predecessor: continue
+        current = root
+        while current in successor:
+            current = successor[current]
+            mapping[current] = root
 
-    return data
+    return mapping
+

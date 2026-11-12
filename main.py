@@ -75,6 +75,14 @@ def detect_court(video, out, force):
     return calibration
 
 
+def video_fps(video):
+    import cv2
+    cap = cv2.VideoCapture(video)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    return fps if fps and fps > 0 else 30.0
+
+
 def process_video(video, args):
     out = os.path.join(os.path.abspath(args.out_dir), os.path.splitext(os.path.basename(video))[0])
     os.makedirs(out, exist_ok=True)
@@ -90,8 +98,8 @@ def process_video(video, args):
     #appliquer l'homographie
     apply_homography(H, out)
 
-    #connecter les joueurs
-    #connect_players(os.path.join(out, "data_homography.json"))
+    #connecter les joueurs (réassociation des ids après disparition) -> data_tracks.json
+    connect_players(out, fps=video_fps(video))
     return out
 
 

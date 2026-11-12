@@ -10,8 +10,10 @@ def retrieve_data(path="data_homography.json"):
     for frame, humans in dico.items():
         for person in humans:
             track_id, x, y = person
+            #le tracker n'a pas encore attribué d'id : point inutilisable pour l'association
+            if track_id is None: continue
             array.append([int(frame), int(track_id), x, y])
 
-    array = np.array(array, dtype=np.float64)
+    array = np.array(array, dtype=np.float64).reshape(-1, 4)
 
     return array
