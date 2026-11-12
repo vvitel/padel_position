@@ -56,7 +56,7 @@ def detect_players(video_path, start, end, step, model, k, f, cx, cy, H):
                         left_ankle, right_ankle = keypoints[0][15], keypoints[0][16]
                         x_left_ankle, y_left_ankle = left_ankle[:2]
                         x_right_ankle, y_right_ankle = right_ankle[:2]
-                        if (x_left_ankle != 0) or (y_left_ankle == 0) or (x_right_ankle != 0) or (y_right_ankle != 0):
+                        if (x_left_ankle != 0) or (y_left_ankle != 0) or (x_right_ankle != 0) or (y_right_ankle != 0):
                             point_undistorted = undistort_points([[bottom_center_x, bottom_center_y]], cam)
                             dic_pos_frame[cpt] = {"id": track_id, "position": point_undistorted[0].tolist()}
                             cpt += 1

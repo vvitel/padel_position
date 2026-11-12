@@ -10,8 +10,9 @@ def retrieve_data():
     for frame, humans in dico.items():
         for person in humans:
             track_id, x, y = person
+            if track_id == None:
+                track_id = 5_000_000_000
             array.append([int(frame), int(track_id), x, y])
 
     array = np.array(array, dtype=np.float64)
-
     return array
