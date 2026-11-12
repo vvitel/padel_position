@@ -25,7 +25,7 @@ For how the algorithm works, and the road that led to it, see
 
 ```
 source .venv/bin/activate
-uv pip install -r requirements.txt        # numpy, opencv-python
+uv pip install -r ../requirements.txt     # requirements unique, à la racine du dépôt
 ```
 
 Plate building shells out to **ffmpeg**. It is used with `-skip_frame nokey`,
