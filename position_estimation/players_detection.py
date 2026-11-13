@@ -45,7 +45,7 @@ def detect_players(video_path, start, end, step, model, k, f, cx, cy, H, out_dir
 
                 #appliquer le modèle box
                 if frame_index % step == 0:
-                    result_box = model_box.track(frame, imgsz=BOX_IMGSZ, classes=[0], conf=0.15, iou=0.65, tracker=TRACKER_CFG,
+                    result_box = model_box.track(frame, imgsz=BOX_IMGSZ, classes=[0], conf=0.05, iou=0.65, tracker=TRACKER_CFG,
                                                  verbose=False, persist=True, quantize=16 if half else None)
                     dico[frame_index] = _positions_in_frame(frame, result_box[0].boxes, model_pose, pose_imgsz, half,
                                                             cam, R, C, H, f, cx, cy)
