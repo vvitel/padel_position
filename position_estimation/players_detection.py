@@ -17,7 +17,7 @@ TRACKER_CFG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 
 
 def detect_players(video_path, start, end, step, model, k, f, cx, cy, H, out_dir=".",
-                   half=True, pose_imgsz=960, box_model="yolo26m.pt", pose_model="yolo26m-pose.pt"):
+                   half=True, pose_imgsz=960, box_model="yolo26m.pt", pose_model="yolo26m-pose.pt", debug=False):
     #chargement des modèles (rechargés pour chaque vidéo : le tracker ne doit pas garder l'état de la précédente)
     model_box = YOLO(box_model, task="detect")
     model_pose = YOLO(pose_model, task="pose")
@@ -35,7 +35,7 @@ def detect_players(video_path, start, end, step, model, k, f, cx, cy, H, out_dir
         frame_index = start
         cap.set(cv2.CAP_PROP_POS_FRAMES, start)
 
-        dico = {}
+        dico, dico_debug = {}, {}
         #parcourir les images
         with tqdm(total=max(end - start, 0), desc=os.path.basename(video_path)) as pbar:
             while True:
@@ -47,8 +47,11 @@ def detect_players(video_path, start, end, step, model, k, f, cx, cy, H, out_dir
                 if frame_index % step == 0:
                     result_box = model_box.track(frame, imgsz=BOX_IMGSZ, classes=[0], conf=0.05, iou=0.65, tracker=TRACKER_CFG,
                                                  verbose=False, persist=True, quantize=16 if half else None)
+                    #debug : toutes les détections de la frame (même celles écartées), pour la vidéo de debug
+                    debug_frame = [] if debug else None
                     dico[frame_index] = _positions_in_frame(frame, result_box[0].boxes, model_pose, pose_imgsz, half,
-                                                            cam, R, C, H, f, cx, cy)
+                                                            cam, R, C, H, f, cx, cy, debug_frame)
+                    if debug: dico_debug[frame_index] = debug_frame
 
                 frame_index += 1
                 pbar.update(1)
@@ -58,12 +61,17 @@ def detect_players(video_path, start, end, step, model, k, f, cx, cy, H, out_dir
     #enregistrer les résultats
     with open(os.path.join(out_dir, "data_pose.json"), "w") as fp:
         json.dump(dico, fp)
+    if debug:
+        with open(os.path.join(out_dir, "data_debug.json"), "w") as fp:
+            json.dump(dico_debug, fp)
 
 
-def _positions_in_frame(frame, boxes, model_pose, pose_imgsz, half, cam, R, C, H, f, cx, cy):
+def _positions_in_frame(frame, boxes, model_pose, pose_imgsz, half, cam, R, C, H, f, cx, cy, debug=None):
+    #debug : liste à remplir avec une entrée par box détectée (position retenue ou raison de l'abandon)
     #un seul transfert GPU -> CPU par frame plutôt qu'un par box
     xyxy = boxes.xyxy.cpu().numpy().astype(float)
     ids = boxes.id.int().cpu().tolist() if boxes.id is not None else [None] * len(xyxy)
+    confs = boxes.conf.cpu().tolist() if debug is not None else [None] * len(xyxy)
 
     #boxes qui atteignent le bas de l'image : on regroupe leurs crops pour un seul appel au modèle pose
     crops, crop_of = [], {}
@@ -80,29 +88,46 @@ def _positions_in_frame(frame, boxes, model_pose, pose_imgsz, half, cam, R, C, H
     dic_pos_frame, cpt = {}, 0
     for i, (x1, y1, x2, y2) in enumerate(xyxy):
         track_id = ids[i]
+        #entrée de debug (jetée si debug est None) : status "ok" ou raison de l'abandon, method "bbox" ou "nose",
+        #foot = pieds en pixels non distordus, nose/ankles = keypoints en pixels de l'image d'origine
+        rec = {"id": track_id, "box": [float(x1), float(y1), float(x2), float(y2)], "conf": confs[i],
+               "status": "ok", "method": None, "foot": None, "nose": None, "ankles": None}
+        if debug is not None: debug.append(rec)
         #récupérer le point centre bas de la box
         bottom_center_x = (x1 + x2) / 2
         bottom_center_y = y2
 
         #si la box atteint le bas de l'image
         if bottom_center_y >= frame.shape[0] - 2:
-            if i not in crop_of: continue
+            if i not in crop_of:
+                rec["status"] = "no_crop"
+                continue
             keypoints = poses[crop_of[i]].keypoints.data
-            if len(keypoints) == 0: continue
+            if len(keypoints) == 0:
+                rec["status"] = "no_pose"
+                continue
             kp = keypoints[0].cpu()
+            #keypoints (nez, chevilles) repassés des coordonnées du crop à celles de l'image
+            rec["nose"] = [float(kp[0, 0]) + int(x1), float(kp[0, 1]) + int(y1), float(kp[0, 2])]
+            rec["ankles"] = [[float(kp[j, 0]) + int(x1), float(kp[j, 1]) + int(y1), float(kp[j, 2])] for j in (15, 16)]
 
             #si aucune cheville n'est visible, estimer les pieds à partir du nez
             #(sinon on garde le centre bas de la box, traité plus bas)
             if not (kp[15, 2] > KEYPOINT_CONF or kp[16, 2] > KEYPOINT_CONF):
                 #récupérer le point du nez
-                if kp[0, 2] <= KEYPOINT_CONF: continue
+                if kp[0, 2] <= KEYPOINT_CONF:
+                    rec["status"] = "no_nose"
+                    continue
                 #repasser des coordonnées du crop à celles de l'image
                 x_nose, y_nose = float(kp[0, 0]) + int(x1), float(kp[0, 1]) + int(y1)
                 nose_undistorted = undistort_points([[x_nose, y_nose]], cam)
                 x_nose_undistorted, y_nose_undistorted = nose_undistorted[0]
                 #estimer position des pieds (en pixels non distordus)
                 foot = find_foot_with_nose(x_nose_undistorted, y_nose_undistorted, R, C, H, f, cx, cy, NOSE_HEIGHT)
-                if foot is None: continue
+                if foot is None:
+                    rec["status"] = "nose_failed"
+                    continue
+                rec["method"], rec["foot"] = "nose", list(foot)
                 dic_pos_frame[cpt] = {"id": track_id,
                                       "position": list(foot)}
                 cpt += 1
@@ -115,6 +140,7 @@ def _positions_in_frame(frame, boxes, model_pose, pose_imgsz, half, cam, R, C, H
         )
 
         #garder la position
+        rec["method"], rec["foot"] = "bbox", point_undistorted[0].tolist()
         dic_pos_frame[cpt] = {"id": track_id,
                               "position": point_undistorted[0].tolist()}
         cpt += 1

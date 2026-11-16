@@ -23,6 +23,28 @@ Résultats dans `outputs/<nom de la vidéo>/` (`--out_dir` pour changer) : `cali
 | `--pose_imgsz` | 960 | taille d'entrée du modèle pose sur les crops (essayer 416) |
 | `--box_model` / `--pose_model` | `yolo26m.pt` / `yolo26m-pose.pt` | `.pt` ou `.engine` TensorRT |
 | `--force_court` | non | refaire la détection du court même si `calibration.json` existe |
+| `--debug_video` | non | écrire `debug.mp4` (voir ci-dessous) ; écrit aussi `data_debug.json` |
+| `--debug_max_side` | 1600 | plus grand côté (px) de la vue principale de la vidéo de debug |
+
+## Vidéo de debug
+
+`--debug_video` produit `outputs/<nom de la vidéo>/debug.mp4` (une image par frame traitée, lue à vitesse réelle) :
+
+Le décodage, le rendu et l'encodage tournent en parallèle (~100 images/s en 1080p sur 16 coeurs). L'encodage est en H.264
+via `ffmpeg` s'il est dans le PATH (rapide, fichiers ~10x plus petits), sinon en `mp4v` via OpenCV (plus lent, plus gros).
+
+- **vue principale** : la vidéo redressée (sans distorsion) sur un canevas qui contient tout le terrain ; hors de la
+  vidéo d'origine (fond uni), seules les lignes du terrain calculées sont visibles (contour blanc, filet orange,
+  lignes de service cyan). Si elles ne recouvrent pas les lignes peintes, la calibration est à revoir.
+- **chaque détection** : contour de la box (redressé), id corrigé `#3` (avec `raw N` si l'id du tracker a été
+  réassocié), confiance, position en mètres, trajectoire des 2 dernières secondes.
+- **pieds** : rond plein = centre bas de la box ; losange = estimé depuis le nez (rond creux = centre bas de la box
+  qui aurait été pris sinon, point magenta = nez, verts = chevilles visibles).
+- **détections ignorées** (box grise) avec la raison : pas de pose, ni cheville ni nez, hors terrain, pas d'id.
+- **bandeau** : frame, temps, nombre de détections et de joueurs ; passe en rouge s'il n'y a pas exactement 4 joueurs
+  ou si un id corrigé apparaît deux fois.
+- **panneau latéral** : mini-carte du terrain vu de dessus, liste des joueurs (id corrigé, id brut, position,
+  méthode), détections ignorées, et dernières réassociations d'ids.
 
 La détection du court n'est faite qu'une fois par vidéo : `calibration.json` est réutilisé aux lancements suivants.
 Elle a besoin de `ffmpeg` dans le PATH.

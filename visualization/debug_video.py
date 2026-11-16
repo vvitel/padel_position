@@ -1,0 +1,483 @@
+import os
+import json
+import math
+import shutil
+import subprocess
+import tempfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import cv2
+import numpy as np
+from tqdm import tqdm
+from position_estimation.apply_homography import image_to_world, in_court, COURT_WIDTH, COURT_LENGTH
+from position_estimation.camera_functions.get_camera_parameters import get_camera_parameters
+from position_estimation.camera_functions.undistort_points import undistort_points
+from position_estimation.players_detection import KEYPOINT_CONF
+
+#vidéo de debug : la vidéo redressée (sans distorsion) sur un canevas qui contient tout le terrain, avec
+#les lignes du terrain calculées, les détections (box, id corrigé, pieds), et un panneau latéral (mini-carte + infos)
+
+#géométrie du terrain en mètres (normes FIP, voir padel-court-detector/padelcourt/court.py)
+NET_Y = COURT_LENGTH / 2
+SERVICE_OFFSET = 6.95
+CENTRE_X = COURT_WIDTH / 2
+EXPECTED_PLAYERS = 4
+
+#lignes du terrain : (point 1, point 2, couleur BGR, épaisseur)
+WHITE, ORANGE, CYAN = (235, 235, 235), (0, 165, 255), (255, 220, 60)
+COURT_LINES = [
+    ((0, 0), (COURT_WIDTH, 0), WHITE, 2),
+    ((COURT_WIDTH, 0), (COURT_WIDTH, COURT_LENGTH), WHITE, 2),
+    ((COURT_WIDTH, COURT_LENGTH), (0, COURT_LENGTH), WHITE, 2),
+    ((0, COURT_LENGTH), (0, 0), WHITE, 2),
+    ((0, NET_Y), (COURT_WIDTH, NET_Y), ORANGE, 2),
+    ((0, NET_Y - SERVICE_OFFSET), (COURT_WIDTH, NET_Y - SERVICE_OFFSET), CYAN, 1),
+    ((0, NET_Y + SERVICE_OFFSET), (COURT_WIDTH, NET_Y + SERVICE_OFFSET), CYAN, 1),
+    ((CENTRE_X, NET_Y - SERVICE_OFFSET), (CENTRE_X, NET_Y + SERVICE_OFFSET), CYAN, 1),
+]
+
+#un id corrigé = une couleur (palette de couleurs bien distinctes, en RGB)
+PALETTE = [tuple(c[::-1]) for c in [(230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200), (245, 130, 48),
+                                    (145, 30, 180), (70, 240, 240), (240, 50, 230), (210, 245, 60), (250, 190, 212),
+                                    (0, 128, 128), (170, 110, 40)]]
+GRAY = (150, 150, 150)
+BACKGROUND = (38, 30, 26)
+
+#raison pour laquelle une détection n'est pas utilisée (status de data_debug.json, puis cas détectés ici)
+REASONS = {"no_crop": "no crop", "no_pose": "no pose", "no_nose": "no ankle/nose", "nose_failed": "nose ray failed",
+           "off_court": "off court", "no_id": "no track id"}
+
+CANVAS_MARGIN = 0.04      #marge autour du terrain (fraction de sa taille à l'écran)
+FOOTPRINT_CLAMP = 0.6     #le fisheye étire énormément les bords de l'image : on borne l'empreinte à 60% autour du terrain
+PANEL_W = 440
+TRAIL_SECONDS = 2.0
+EVENTS_SHOWN = 6
+PREFETCH = 6              #frames lues d'avance / écrites en attente (décodage et encodage tournent pendant le rendu)
+PER_EDGE = 8              #points échantillonnés par côté d'une box (une box droite devient courbe une fois redressée)
+N_PERIM = 4 * PER_EDGE
+BOTTOM, NOSE, ANKLE_L, ANKLE_R = N_PERIM, N_PERIM + 1, N_PERIM + 2, N_PERIM + 3
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+def _even(v):
+    return int(math.ceil(v / 2) * 2)
+
+
+def _project(hom, pts):
+    #homographie sur des points (N, 2) -> points (N, 2) et dénominateurs
+    p = np.c_[np.asarray(pts, dtype=float), np.ones(len(pts))] @ hom.T
+    return p[:, :2] / p[:, 2:3], p[:, 2]
+
+
+class DebugRenderer:
+    def __init__(self, calibration, frame_size, max_side, video_fps, mapping, events):
+        model, k, f, cx, cy, self.hom = get_camera_parameters(calibration)
+        self.cam = {"model": model, "k": k, "f": f, "cx": cx, "cy": cy}
+        self.hom_inv = np.linalg.inv(self.hom)
+        self.mapping, self.events = mapping, events
+        self.trail_frames = TRAIL_SECONDS * video_fps
+        self.trails = {}
+
+        self._build_canvas(frame_size, max_side)
+        self.fs = max(0.45, min(0.9, self.cw / 2200))
+        self.thick = 1 if self.fs < 0.8 else 2
+        self._build_remap()
+        self._build_court_layer()
+        self._build_panel_background()
+
+    #---------- construction (une seule fois par vidéo) ----------
+
+    def _build_canvas(self, frame_size, max_side):
+        w_img, h_img = frame_size
+
+        #les 4 coins du terrain, y compris la partie basse hors de l'image d'origine
+        corners = np.array([[0, 0], [COURT_WIDTH, 0], [COURT_WIDTH, COURT_LENGTH], [0, COURT_LENGTH]], dtype=float)
+        court, w = _project(self.hom, corners)
+        if (w <= 1e-9).any():
+            raise RuntimeError("une partie du terrain est derrière la caméra : impossible de construire le canevas")
+        lo, hi = court.min(axis=0), court.max(axis=0)
+
+        #empreinte de l'image d'origine une fois redressée (bornée, voir FOOTPRINT_CLAMP)
+        t = np.linspace(0, 1, 60, endpoint=False)
+        zeros, w_ones, h_ones = np.zeros_like(t), np.full_like(t, w_img), np.full_like(t, h_img)
+        edge = np.vstack([np.c_[t * w_img, zeros], np.c_[w_ones, t * h_img],
+                          np.c_[w_img - t * w_img, h_ones], np.c_[zeros, h_img - t * h_img]])
+        footprint = undistort_points(edge, self.cam)
+        footprint = footprint[np.isfinite(footprint).all(axis=1)]
+        span = hi - lo
+        footprint = np.clip(footprint, lo - FOOTPRINT_CLAMP * span, hi + FOOTPRINT_CLAMP * span)
+        pts = np.vstack([court, footprint])
+        lo, hi = pts.min(axis=0), pts.max(axis=0)
+        pad = CANVAS_MARGIN * (hi - lo)
+        lo, hi = lo - pad, hi + pad
+
+        #le canevas est en pixels non distordus (les mêmes que l'homographie), mis à l'échelle pour tenir dans max_side
+        self.origin = lo
+        self.scale = min(1.0, max_side / float((hi - lo).max()))
+        self.cw, self.ch = (_even(v) for v in (hi - lo) * self.scale)
+
+    def _to_canvas(self, pts_undistorted):
+        return (np.asarray(pts_undistorted, dtype=float) - self.origin) * self.scale
+
+    def _build_remap(self):
+        f, cx, cy = self.cam["f"], self.cam["cx"], self.cam["cy"]
+        K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+        D = np.array([self.cam["k"][0], self.cam["k"][1], 0.0, 0.0], dtype=np.float64)
+        #caméra idéale du canevas : même focale, décalée et mise à l'échelle comme le canevas
+        K_new = np.array([[f * self.scale, 0, (cx - self.origin[0]) * self.scale],
+                          [0, f * self.scale, (cy - self.origin[1]) * self.scale],
+                          [0, 0, 1]], dtype=np.float64)
+        self.map1, self.map2 = cv2.fisheye.initUndistortRectifyMap(K, D, np.eye(3), K_new, (self.cw, self.ch), cv2.CV_16SC2)
+
+        #le polynôme du fisheye n'est monotone que jusqu'à un certain angle : au-delà, la carte reboucle sur l'image
+        theta = np.linspace(0, math.pi / 2, 20000, endpoint=False)
+        theta_d = theta * (1 + D[0] * theta ** 2 + D[1] * theta ** 4)
+        bad = np.nonzero(np.diff(theta_d) <= 0)[0]
+        theta_valid = theta[bad[0]] if bad.size else theta[-1]
+        jj, ii = np.mgrid[0:self.ch, 0:self.cw].astype(np.float32)
+        radius = np.hypot(ii / self.scale + self.origin[0] - cx, jj / self.scale + self.origin[1] - cy)
+        valid = np.arctan(radius / f) <= theta_valid
+
+        #hors de la vidéo d'origine (ou au-delà de theta_valid) : coordonnée hors image, donc remap peint la couleur de
+        #bordure (le fond uni) sans masque ni addition par frame ; il n'y reste que les lignes du terrain
+        self.map1[~valid] = -30000
+        self.img = np.empty((self.ch, self.cw, 3), np.uint8)
+
+    def _build_court_layer(self):
+        #lignes du terrain calculées (homographie), dessinées une fois pour toutes
+        self.lines = np.zeros((self.ch, self.cw, 3), np.uint8)
+        for p1, p2, color, thickness in COURT_LINES:
+            a, b = self._to_canvas(_project(self.hom, [p1, p2])[0])
+            cv2.line(self.lines, tuple(np.round(a).astype(int)), tuple(np.round(b).astype(int)), color,
+                     thickness, cv2.LINE_AA)
+        self.lines_idx = np.flatnonzero(self.lines.any(axis=2).ravel())
+        self.lines_val = self.lines.reshape(-1, 3)[self.lines_idx]
+
+    def _build_panel_background(self):
+        #mini-carte du terrain vu de dessus (y=0 en haut = fond du court, comme sur la vidéo)
+        self.panel_bg = np.full((self.ch, PANEL_W, 3), (28, 28, 28), np.uint8)
+        extent_x, extent_y = COURT_WIDTH + 2, COURT_LENGTH + 2
+        self.map_scale = min((PANEL_W - 20) / extent_x, (0.6 * self.ch - 20) / extent_y)
+        self.map_origin = ((PANEL_W - extent_x * self.map_scale) / 2, 10.0)
+        corner_a, corner_b = self._to_map((0, 0)), self._to_map((COURT_WIDTH, COURT_LENGTH))
+        cv2.rectangle(self.panel_bg, corner_a, corner_b, (70, 55, 40), -1)
+        for p1, p2, color, thickness in COURT_LINES:
+            cv2.line(self.panel_bg, self._to_map(p1), self._to_map(p2), color, 1, cv2.LINE_AA)
+        self.text_top = int(self.map_origin[1] + extent_y * self.map_scale + 22)
+
+    def _to_map(self, world):
+        return (int(round(self.map_origin[0] + (world[0] + 1) * self.map_scale)),
+                int(round(self.map_origin[1] + (world[1] + 1) * self.map_scale)))
+
+    #---------- rendu d'une frame ----------
+
+    def render(self, frame, frame_index, fps, dets):
+        img = cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR, dst=self.img, borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=BACKGROUND)
+        img.reshape(-1, 3)[self.lines_idx] = self.lines_val
+
+        infos = [self._classify(d) for d in dets]
+        _, pts = self._sample_points(infos)
+        self._update_trails(frame_index, infos)
+        self._draw_trails(img, frame_index)
+        for info, p in zip(infos, pts): self._draw_detection(img, info, p)
+        self._draw_legend(img)
+        self._draw_hud(img, frame_index, fps, infos)
+        return np.hstack([img, self._draw_panel(frame_index, infos)])
+
+    def _classify(self, d):
+        raw = d["id"]
+        cid = self.mapping.get(raw, raw) if raw is not None else None
+        world = image_to_world(self.hom_inv, *d["foot"]) if d["foot"] else None
+        if d["status"] != "ok": reason = d["status"]
+        elif not in_court(*world): reason = "off_court"
+        elif raw is None: reason = "no_id"
+        else: reason = None
+        return {"det": d, "raw": raw, "cid": cid, "world": world, "reason": reason}
+
+    def _sample_points(self, infos):
+        #pour chaque détection : contour de la box + centre bas + nez + chevilles, redressés d'un seul appel
+        #retour : (n, N_PERIM + 4, 2) en pixels du canevas, et les mêmes en entiers pour le dessin
+        if not infos: return [], []
+        boxes = np.array([i["det"]["box"] for i in infos], dtype=float)
+        x1, y1, x2, y2 = (boxes[:, j, None] for j in range(4))
+        t = np.linspace(0, 1, PER_EDGE, endpoint=False)[None, :]
+        full = lambda v: np.broadcast_to(v, (len(boxes), PER_EDGE))
+        perimeter = np.concatenate([np.stack([x1 + (x2 - x1) * t, full(y1)], -1), np.stack([full(x2), y1 + (y2 - y1) * t], -1),
+                                    np.stack([x2 - (x2 - x1) * t, full(y2)], -1), np.stack([full(x1), y2 - (y2 - y1) * t], -1)], 1)
+        bottom = np.stack([(boxes[:, 0] + boxes[:, 2]) / 2, boxes[:, 3]], -1)
+        #keypoints absents : on retombe sur le centre bas (point jamais dessiné)
+        keypoints = np.repeat(bottom[:, None, :], 3, axis=1)
+        for n, info in enumerate(infos):
+            d = info["det"]
+            if d["nose"]: keypoints[n, 0] = d["nose"][:2]
+            for j, ankle in enumerate(d["ankles"] or []): keypoints[n, 1 + j] = ankle[:2]
+        pts = np.concatenate([perimeter, bottom[:, None, :], keypoints], 1)
+        canvas = self._to_canvas(undistort_points(pts.reshape(-1, 2), self.cam)).reshape(len(boxes), N_PERIM + 4, 2)
+        return canvas, np.rint(canvas).astype(np.int32).tolist()
+
+    def _color(self, info):
+        return PALETTE[info["cid"] % len(PALETTE)] if info["reason"] is None else GRAY
+
+    def _update_trails(self, frame_index, infos):
+        for info in infos:
+            if info["reason"] is None:
+                trail = self.trails.setdefault(info["cid"], deque(maxlen=int(self.trail_frames) + 1))
+                trail.append((frame_index, np.rint(self._to_canvas(info["det"]["foot"])).astype(np.int32), self._to_map(info["world"])))
+
+    def _recent(self, cid, frame_index):
+        #(canevas, mini-carte) des points des TRAIL_SECONDS dernières secondes
+        limit = frame_index - self.trail_frames
+        return [(c, m) for fr, c, m in self.trails[cid] if fr >= limit]
+
+    def _draw_trails(self, img, frame_index):
+        for cid in self.trails:
+            recent = self._recent(cid, frame_index)
+            if len(recent) >= 2:
+                cv2.polylines(img, [np.array([c for c, _ in recent], np.int32)], False, PALETTE[cid % len(PALETTE)], 2, cv2.LINE_AA)
+
+    def _draw_detection(self, img, info, p):
+        d, used = info["det"], info["reason"] is None
+        color = self._color(info)
+        r = max(4, int(7 * self.fs))
+
+        #contour de la box (redressé)
+        perimeter = np.array(p[:N_PERIM], np.int32)
+        cv2.polylines(img, [perimeter], True, color, 2 if used else 1, cv2.LINE_AA)
+
+        #keypoints de la pose (quand le modèle pose a tourné) : nez en magenta, chevilles visibles en vert
+        if d["nose"] and d["nose"][2] > KEYPOINT_CONF:
+            cv2.circle(img, tuple(p[NOSE]), max(3, r // 2), (255, 0, 255), -1, cv2.LINE_AA)
+        for ankle, idx in zip(d["ankles"] or [], (ANKLE_L, ANKLE_R)):
+            if ankle[2] > KEYPOINT_CONF:
+                cv2.circle(img, tuple(p[idx]), max(3, r // 2), (0, 255, 0), -1, cv2.LINE_AA)
+
+        #pieds tels qu'estimés par l'algorithme
+        if d["foot"]:
+            foot = tuple(np.rint(self._to_canvas(d["foot"])).astype(int).tolist())
+            if d["method"] == "nose":
+                #estimation depuis le nez : losange, relié au nez ; rond creux = centre bas de la box (non utilisé)
+                bottom = tuple(p[BOTTOM])
+                cv2.line(img, tuple(p[NOSE]), foot, color, 1, cv2.LINE_AA)
+                cv2.circle(img, bottom, r, color, 1, cv2.LINE_AA)
+                diamond = np.array([[foot[0], foot[1] - r - 2], [foot[0] + r + 2, foot[1]],
+                                    [foot[0], foot[1] + r + 2], [foot[0] - r - 2, foot[1]]], np.int32)
+                cv2.fillConvexPoly(img, diamond, color, cv2.LINE_AA)
+                cv2.polylines(img, [diamond], True, (0, 0, 0), 1, cv2.LINE_AA)
+            else:
+                #centre bas de la box : rond plein
+                cv2.circle(img, foot, r, color, -1, cv2.LINE_AA)
+                cv2.circle(img, foot, r, (0, 0, 0), 1, cv2.LINE_AA)
+
+        #étiquette
+        conf = "" if d["conf"] is None else f"c{d['conf']:.2f}"
+        if used:
+            raw = "" if info["raw"] == info["cid"] else f" (raw {info['raw']})"
+            x, y = info["world"]
+            lines = [(f"#{info['cid']}{raw}", color), (f"{conf} ({x:.1f},{y:.1f})m {d['method']}", (255, 255, 255))]
+        else:
+            raw = "-" if info["raw"] is None else info["raw"]
+            lines = [(f"raw {raw}: {REASONS[info['reason']]} {conf}", GRAY)]
+        self._draw_box_label(img, perimeter, lines)
+
+    def _draw_box_label(self, img, perimeter, lines):
+        (_, th), base = cv2.getTextSize("Ag", FONT, self.fs, self.thick)
+        lh = th + base + 4
+        x, top, bottom = int(perimeter[:, 0].min()), int(perimeter[:, 1].min()), int(perimeter[:, 1].max())
+        if top - lh * len(lines) - 2 >= 0:
+            ys = [top - 4 - lh * (len(lines) - 1 - i) for i in range(len(lines))]
+        else:
+            ys = [bottom + lh * (i + 1) for i in range(len(lines))]
+        for (text, color), y in zip(lines, ys): self._label(img, text, (x, y), color)
+
+    def _label(self, img, text, org, color, scale=None):
+        #texte lisible sur n'importe quel fond (rectangle noir derrière), recadré dans l'image
+        scale = scale or self.fs
+        (tw, th), base = cv2.getTextSize(text, FONT, scale, self.thick)
+        x = int(min(max(org[0], 0), max(0, img.shape[1] - tw - 2)))
+        y = int(min(max(org[1], th + 2), img.shape[0] - base - 2))
+        cv2.rectangle(img, (x, y - th - 2), (x + tw + 2, y + base), (0, 0, 0), -1)
+        cv2.putText(img, text, (x + 1, y - 1), FONT, scale, color, self.thick, cv2.LINE_AA)
+        return th + base + 6
+
+    def _draw_hud(self, img, frame_index, fps, infos):
+        used = [i for i in infos if i["reason"] is None]
+        cids = [i["cid"] for i in used]
+        t = frame_index / fps
+        text = f"frame {frame_index}  t={int(t // 60):02d}:{t % 60:04.1f}  detections {len(infos)}  players {len(set(cids))}/{EXPECTED_PLAYERS}"
+        problem = len(set(cids)) != EXPECTED_PLAYERS or len(set(cids)) != len(cids)
+        if len(set(cids)) != len(cids): text += "  DUPLICATE ID"
+        self._label(img, text, (6, int(28 * self.fs) + 6), (80, 80, 255) if problem else (255, 255, 255), self.fs * 1.1)
+
+    def _draw_legend(self, img):
+        r = max(4, int(7 * self.fs))
+        rows = [("foot = bbox bottom-centre", "circle"),
+                ("foot = estimated from nose (hollow circle = bbox bottom)", "diamond"),
+                ("magenta = nose, green = visible ankles (pose)", None),
+                ("grey box = ignored detection (reason shown)", None),
+                ("#id = corrected id; raw = tracker id before re-association", None)]
+        y = img.shape[0] - 6
+        for text, icon in reversed(rows):
+            h = self._label(img, text, (6 + 3 * r, y), (255, 255, 255))
+            cy = y - h // 2 + 2
+            if icon == "circle": cv2.circle(img, (6 + r, cy), r, (255, 255, 255), -1, cv2.LINE_AA)
+            if icon == "diamond":
+                cv2.fillConvexPoly(img, np.array([[6 + r, cy - r], [6 + 2 * r, cy], [6 + r, cy + r], [6, cy]], np.int32),
+                                   (255, 255, 255), cv2.LINE_AA)
+            y -= h
+
+    def _draw_panel(self, frame_index, infos):
+        panel = self.panel_bg.copy()
+        radius = max(5, int(0.35 * self.map_scale))
+
+        #mini-carte : trajectoires récentes, joueurs retenus (plein) et détections hors terrain (creux)
+        for cid in self.trails:
+            line = [m for _, m in self._recent(cid, frame_index)]
+            if len(line) >= 2: cv2.polylines(panel, [np.array(line, np.int32)], False, PALETTE[cid % len(PALETTE)], 1, cv2.LINE_AA)
+        for info in infos:
+            if info["world"] is None: continue
+            x, y = info["world"]
+            if not (-1 <= x <= COURT_WIDTH + 1 and -1 <= y <= COURT_LENGTH + 1): continue
+            center = self._to_map((x, y))
+            if info["reason"] is None:
+                cv2.circle(panel, center, radius, self._color(info), -1, cv2.LINE_AA)
+                cv2.circle(panel, center, radius, (0, 0, 0), 1, cv2.LINE_AA)
+                text = str(info["cid"])
+                (tw, th), _ = cv2.getTextSize(text, FONT, 0.45, 1)
+                cv2.putText(panel, text, (center[0] - tw // 2, center[1] + th // 2), FONT, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+            else:
+                cv2.circle(panel, center, radius, GRAY, 1, cv2.LINE_AA)
+
+        #liste texte
+        y = self.text_top
+        def row(text, color, swatch=None):
+            nonlocal y
+            if y > self.ch - 6: return
+            if swatch is not None: cv2.rectangle(panel, (10, y - 10), (20, y), swatch, -1)
+            cv2.putText(panel, text, (28 if swatch is not None else 10, y), FONT, 0.5, color, 1, cv2.LINE_AA)
+            y += 20
+
+        used = sorted((i for i in infos if i["reason"] is None), key=lambda i: i["cid"])
+        row("ON COURT  (#corrected id, raw tracker id)", (255, 255, 255))
+        for i in used:
+            x, yw = i["world"]
+            row(f"#{i['cid']}  raw {i['raw']}  ({x:.1f},{yw:.1f})m  {i['det']['method']}", (230, 230, 230), self._color(i))
+        if not used: row("none", GRAY)
+        ignored = [i for i in infos if i["reason"] is not None]
+        if ignored:
+            y += 6
+            row("IGNORED", (255, 255, 255))
+            for i in ignored: row(f"raw {'-' if i['raw'] is None else i['raw']}: {REASONS[i['reason']]}", GRAY)
+        past = [e for e in self.events if e[0] <= frame_index][-EVENTS_SHOWN:]
+        y += 6
+        row("RE-ASSOCIATIONS  (raw -> #id)", (255, 255, 255))
+        for frame, raw, cid in past: row(f"frame {frame}: raw {raw} -> #{cid}", PALETTE[cid % len(PALETTE)])
+        if not past: row("none yet", GRAY)
+        return panel
+
+
+def load_debug(out_dir):
+    path = os.path.join(out_dir, "data_debug.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{path} introuvable : detect_players doit être lancé avec debug=True")
+    with open(path, "r") as fp:
+        return {int(frame): dets for frame, dets in json.load(fp).items()}
+
+
+def reassociation_events(dico, mapping):
+    #première frame où apparaît chaque id brut qui a été rattaché à un id plus ancien
+    first = {}
+    for frame in sorted(dico):
+        for d in dico[frame]:
+            if d["id"] in mapping: first.setdefault(d["id"], frame)
+    return sorted((frame, raw, mapping[raw]) for raw, frame in first.items())
+
+
+class VideoSink:
+    """Écrit des frames BGR. H.264 via ffmpeg (multi-thread, petits fichiers, lisible partout) s'il est dans le PATH,
+    sinon mp4v d'OpenCV (monothread, bien plus lent et plus gros)."""
+
+    def __init__(self, path, fps, size):
+        self.path, self.proc, self.writer = path, None, None
+        exe = shutil.which("ffmpeg")
+        if exe:
+            self.log = tempfile.TemporaryFile()
+            cmd = [exe, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{size[0]}x{size[1]}",
+                   "-r", f"{fps:.6f}", "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                   "-pix_fmt", "yuv420p", "-movflags", "+faststart", path]
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.log)
+        else:
+            self.writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+            if not self.writer.isOpened(): raise RuntimeError(f"impossible d'écrire {path}")
+
+    def write(self, img):
+        if self.writer is not None:
+            self.writer.write(img)
+            return
+        try:
+            self.proc.stdin.write(img.data)
+        except (BrokenPipeError, OSError):
+            raise RuntimeError(f"ffmpeg a échoué : {self._error()}")
+
+    def _error(self):
+        self.log.seek(0)
+        return self.log.read().decode(errors="replace").strip()
+
+    def close(self):
+        if self.writer is not None: self.writer.release()
+        if self.proc is None: return
+        try:
+            self.proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        if self.proc.wait() != 0: raise RuntimeError(f"ffmpeg a échoué : {self._error()}")
+        self.log.close()
+
+
+def render_debug_video(video_path, out_dir, calibration, mapping, fps, step=1, max_side=1600):
+    dico = load_debug(out_dir)
+    frames = sorted(dico)
+    if not frames: raise RuntimeError("data_debug.json est vide : aucune frame à afficher")
+    wanted, last = set(frames), frames[-1]
+
+    cap = cv2.VideoCapture(video_path)
+    out_path = os.path.join(out_dir, "debug.mp4")
+    sink = None
+    try:
+        size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        renderer = DebugRenderer(calibration, size, max_side, fps, mapping, reassociation_events(dico, mapping))
+        #la vidéo de debug ne contient que les frames traitées : on la ralentit pour qu'elle reste en temps réel
+        sink = VideoSink(out_path, fps / max(step, 1), (renderer.cw + PANEL_W, renderer.ch))
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frames[0])
+        state = {"index": frames[0]}
+
+        def read_next():
+            #prochaine frame à afficher (les autres sont sautées) ; un seul thread lecteur, donc l'ordre est garanti
+            while state["index"] <= last:
+                i = state["index"]
+                state["index"] += 1
+                if i in wanted:
+                    ret, frame = cap.read()
+                    return (i, frame) if ret else None
+                if not cap.grab(): return None
+            return None
+
+        #décodage, rendu (ce thread) et encodage sont trois étapes en parallèle : OpenCV libère le GIL
+        with ThreadPoolExecutor(1) as reader, ThreadPoolExecutor(1) as writer, tqdm(total=len(frames), desc="debug video") as pbar:
+            reads = deque(reader.submit(read_next) for _ in range(PREFETCH))
+            writes = deque()
+            while reads:
+                item = reads.popleft().result()
+                if item is None: break
+                reads.append(reader.submit(read_next))
+                index, frame = item
+                #result() relève les erreurs du thread d'écriture ; la file bornée limite la mémoire
+                if len(writes) >= PREFETCH: writes.popleft().result()
+                writes.append(writer.submit(sink.write, renderer.render(frame, index, fps, dico[index])))
+                pbar.update(1)
+            for fut in writes: fut.result()
+    finally:
+        cap.release()
+        if sink is not None: sink.close()
+    return out_path

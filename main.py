@@ -10,6 +10,7 @@ from position_estimation.camera_functions.get_camera_parameters import get_camer
 from position_estimation.players_detection import detect_players
 from position_estimation.apply_homography import apply_homography
 from temporal_association.connect_players import connect_players
+from visualization.debug_video import render_debug_video
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 COURT_SCRIPT = os.path.join(REPO, "padel-court-detector", "detect_court.py")
@@ -31,6 +32,9 @@ def parse_args():
     ap.add_argument("--box_model", default="yolo26m.pt", help="poids du détecteur (.pt ou .engine)")
     ap.add_argument("--pose_model", default="yolo26m-pose.pt", help="poids du modèle pose (.pt ou .engine)")
     ap.add_argument("--force_court", action="store_true", help="refaire la détection du court même si calibration.json existe")
+    ap.add_argument("--debug_video", action="store_true",
+                    help="générer <out_dir>/<nom de la vidéo>/debug.mp4 : vidéo redressée, terrain entier, boxes, ids corrigés, pieds")
+    ap.add_argument("--debug_max_side", type=int, default=1600, help="plus grand côté (px) de la vue principale de la vidéo de debug")
     return ap.parse_args()
 
 
@@ -93,13 +97,20 @@ def process_video(video, args):
     #détection des joueurs
     model, k, f, cx, cy, H = get_camera_parameters(calibration)
     detect_players(video, args.frame_start, args.frame_end, args.frame_step, model, k, f, cx, cy, H, out_dir=out,
-                   half=args.half, pose_imgsz=args.pose_imgsz, box_model=args.box_model, pose_model=args.pose_model)
+                   half=args.half, pose_imgsz=args.pose_imgsz, box_model=args.box_model, pose_model=args.pose_model,
+                   debug=args.debug_video)
 
     #appliquer l'homographie
     apply_homography(H, out)
 
     #connecter les joueurs (réassociation des ids après disparition) -> data_tracks.json
-    connect_players(out, fps=video_fps(video))
+    fps = video_fps(video)
+    mapping = connect_players(out, fps=fps)
+
+    #vidéo de debug (détections + ids corrigés)
+    if args.debug_video:
+        path = render_debug_video(video, out, calibration, mapping, fps, step=args.frame_step, max_side=args.debug_max_side)
+        print(f"[{os.path.basename(video)}] vidéo de debug : {path}")
     return out
 
 
