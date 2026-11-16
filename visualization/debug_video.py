@@ -251,19 +251,32 @@ class DebugRenderer:
         for ankle, idx in zip(d["ankles"] or [], (ANKLE_L, ANKLE_R)):
             if ankle[2] > KEYPOINT_CONF:
                 cv2.circle(img, tuple(p[idx]), max(3, r // 2), (0, 255, 0), -1, cv2.LINE_AA)
+            elif d["method"] == "ankles":
+                #cheville peu fiable mais quand même utilisée dans le milieu des deux chevilles : rond creux
+                cv2.circle(img, tuple(p[idx]), max(3, r // 2), (0, 255, 0), 1, cv2.LINE_AA)
 
         #pieds tels qu'estimés par l'algorithme
         if d["foot"]:
             foot = tuple(np.rint(self._to_canvas(d["foot"])).astype(int).tolist())
-            if d["method"] == "nose":
-                #estimation depuis le nez : losange, relié au nez ; rond creux = centre bas de la box (non utilisé)
-                bottom = tuple(p[BOTTOM])
-                cv2.line(img, tuple(p[NOSE]), foot, color, 1, cv2.LINE_AA)
-                cv2.circle(img, bottom, r, color, 1, cv2.LINE_AA)
-                diamond = np.array([[foot[0], foot[1] - r - 2], [foot[0] + r + 2, foot[1]],
-                                    [foot[0], foot[1] + r + 2], [foot[0] - r - 2, foot[1]]], np.int32)
-                cv2.fillConvexPoly(img, diamond, color, cv2.LINE_AA)
-                cv2.polylines(img, [diamond], True, (0, 0, 0), 1, cv2.LINE_AA)
+            if d["method"] in ("nose", "ankles"):
+                #estimation par rayon depuis un keypoint, reliée à lui ; rond creux = centre bas de la box (non utilisé)
+                #nez : losange ; milieu des deux chevilles (croix verte) : carré
+                if d["method"] == "nose":
+                    source = tuple(p[NOSE])
+                else:
+                    source = ((p[ANKLE_L][0] + p[ANKLE_R][0]) // 2, (p[ANKLE_L][1] + p[ANKLE_R][1]) // 2)
+                    cv2.line(img, tuple(p[ANKLE_L]), tuple(p[ANKLE_R]), (0, 255, 0), 1, cv2.LINE_AA)
+                    cv2.drawMarker(img, source, (0, 255, 0), cv2.MARKER_CROSS, r, 1, cv2.LINE_AA)
+                cv2.line(img, source, foot, color, 1, cv2.LINE_AA)
+                cv2.circle(img, tuple(p[BOTTOM]), r, color, 1, cv2.LINE_AA)
+                if d["method"] == "nose":
+                    shape = np.array([[foot[0], foot[1] - r - 2], [foot[0] + r + 2, foot[1]],
+                                      [foot[0], foot[1] + r + 2], [foot[0] - r - 2, foot[1]]], np.int32)
+                else:
+                    shape = np.array([[foot[0] - r, foot[1] - r], [foot[0] + r, foot[1] - r],
+                                      [foot[0] + r, foot[1] + r], [foot[0] - r, foot[1] + r]], np.int32)
+                cv2.fillConvexPoly(img, shape, color, cv2.LINE_AA)
+                cv2.polylines(img, [shape], True, (0, 0, 0), 1, cv2.LINE_AA)
             else:
                 #centre bas de la box : rond plein
                 cv2.circle(img, foot, r, color, -1, cv2.LINE_AA)
@@ -312,8 +325,9 @@ class DebugRenderer:
     def _draw_legend(self, img):
         r = max(4, int(7 * self.fs))
         rows = [("foot = bbox bottom-centre", "circle"),
+                ("foot = ground projection of ankles midpoint (cross)", "square"),
                 ("foot = estimated from nose (hollow circle = bbox bottom)", "diamond"),
-                ("magenta = nose, green = visible ankles (pose)", None),
+                ("magenta = nose, green = ankles (hollow = low confidence)", None),
                 ("grey box = ignored detection (reason shown)", None),
                 ("#id = corrected id; raw = tracker id before re-association", None)]
         y = img.shape[0] - 6
@@ -321,6 +335,8 @@ class DebugRenderer:
             h = self._label(img, text, (6 + 3 * r, y), (255, 255, 255))
             cy = y - h // 2 + 2
             if icon == "circle": cv2.circle(img, (6 + r, cy), r, (255, 255, 255), -1, cv2.LINE_AA)
+            if icon == "square":
+                cv2.rectangle(img, (6, cy - r + 1), (6 + 2 * r, cy + r - 1), (255, 255, 255), -1)
             if icon == "diamond":
                 cv2.fillConvexPoly(img, np.array([[6 + r, cy - r], [6 + 2 * r, cy], [6 + r, cy + r], [6, cy]], np.int32),
                                    (255, 255, 255), cv2.LINE_AA)

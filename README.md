@@ -38,8 +38,9 @@ via `ffmpeg` s'il est dans le PATH (rapide, fichiers ~10x plus petits), sinon en
   lignes de service cyan). Si elles ne recouvrent pas les lignes peintes, la calibration est à revoir.
 - **chaque détection** : contour de la box (redressé), id corrigé `#3` (avec `raw N` si l'id du tracker a été
   réassocié), confiance, position en mètres, trajectoire des 2 dernières secondes.
-- **pieds** : rond plein = centre bas de la box ; losange = estimé depuis le nez (rond creux = centre bas de la box
-  qui aurait été pris sinon, point magenta = nez, verts = chevilles visibles).
+- **pieds** : rond plein = centre bas de la box ; carré = milieu des deux chevilles projeté au sol (croix verte = milieu,
+  chevilles peu fiables en rond creux) ; losange = estimé depuis le nez (point magenta). Dans les deux derniers cas, le rond
+  creux est le centre bas de la box qui aurait été pris sinon.
 - **détections ignorées** (box grise) avec la raison : pas de pose, ni cheville ni nez, hors terrain, pas d'id.
 - **bandeau** : frame, temps, nombre de détections et de joueurs ; passe en rouge s'il n'y a pas exactement 4 joueurs
   ou si un id corrigé apparaît deux fois.
