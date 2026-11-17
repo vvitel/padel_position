@@ -10,6 +10,7 @@ from position_estimation.camera_functions.get_camera_parameters import get_camer
 from position_estimation.players_detection import detect_players
 from position_estimation.apply_homography import apply_homography
 from temporal_association.connect_players import connect_players
+from temporal_association.smooth_tracks import smooth_tracks
 from visualization.debug_video import render_debug_video
 
 REPO = os.path.dirname(os.path.abspath(__file__))
@@ -106,6 +107,9 @@ def process_video(video, args):
     #connecter les joueurs (réassociation des ids après disparition) -> data_tracks.json
     fps = video_fps(video)
     mapping = connect_players(out, fps=fps)
+
+    #lisser les trajectoires par id corrigé (Kalman + RTS) -> data_smooth.json
+    smooth_tracks(out, fps=fps)
 
     #vidéo de debug (détections + ids corrigés)
     if args.debug_video:

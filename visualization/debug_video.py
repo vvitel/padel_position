@@ -13,9 +13,11 @@ from position_estimation.apply_homography import image_to_world, in_court, COURT
 from position_estimation.camera_functions.get_camera_parameters import get_camera_parameters
 from position_estimation.camera_functions.undistort_points import undistort_points
 from position_estimation.players_detection import KEYPOINT_CONF
+from temporal_association.smooth_tracks import MAX_GAP_S
 
 #vidéo de debug : la vidéo redressée (sans distorsion) sur un canevas qui contient tout le terrain, avec
-#les lignes du terrain calculées, les détections (box, id corrigé, pieds), et un panneau latéral (mini-carte + infos)
+#les lignes du terrain calculées, les détections (box, id corrigé, pieds), un panneau latéral (mini-carte + infos)
+#avec les positions brutes, et un second panneau avec les trajectoires lissées (data_smooth.json)
 
 #géométrie du terrain en mètres (normes FIP, voir padel-court-detector/padelcourt/court.py)
 NET_Y = COURT_LENGTH / 2
@@ -70,13 +72,14 @@ def _project(hom, pts):
 
 
 class DebugRenderer:
-    def __init__(self, calibration, frame_size, max_side, video_fps, mapping, events):
+    def __init__(self, calibration, frame_size, max_side, video_fps, mapping, events, smooth=None):
         model, k, f, cx, cy, self.hom = get_camera_parameters(calibration)
         self.cam = {"model": model, "k": k, "f": f, "cx": cx, "cy": cy}
         self.hom_inv = np.linalg.inv(self.hom)
         self.mapping, self.events = mapping, events
         self.trail_frames = TRAIL_SECONDS * video_fps
         self.trails = {}
+        self.smooth = smooth
 
         self._build_canvas(frame_size, max_side)
         self.fs = max(0.45, min(0.9, self.cw / 2200))
@@ -84,6 +87,7 @@ class DebugRenderer:
         self._build_remap()
         self._build_court_layer()
         self._build_panel_background()
+        if smooth is not None: self._build_smooth_trails(smooth, video_fps)
 
     #---------- construction (une seule fois par vidéo) ----------
 
@@ -183,7 +187,9 @@ class DebugRenderer:
         for info, p in zip(infos, pts): self._draw_detection(img, info, p)
         self._draw_legend(img)
         self._draw_hud(img, frame_index, fps, infos)
-        return np.hstack([img, self._draw_panel(frame_index, infos)])
+        panels = [img, self._draw_panel(frame_index, infos)]
+        if self.smooth is not None: panels.append(self._draw_smooth_panel(frame_index))
+        return np.hstack(panels)
 
     def _classify(self, d):
         raw = d["id"]
@@ -344,35 +350,15 @@ class DebugRenderer:
 
     def _draw_panel(self, frame_index, infos):
         panel = self.panel_bg.copy()
-        radius = max(5, int(0.35 * self.map_scale))
 
-        #mini-carte : trajectoires récentes, joueurs retenus (plein) et détections hors terrain (creux)
-        for cid in self.trails:
-            line = [m for _, m in self._recent(cid, frame_index)]
-            if len(line) >= 2: cv2.polylines(panel, [np.array(line, np.int32)], False, PALETTE[cid % len(PALETTE)], 1, cv2.LINE_AA)
-        for info in infos:
-            if info["world"] is None: continue
-            x, y = info["world"]
-            if not (-1 <= x <= COURT_WIDTH + 1 and -1 <= y <= COURT_LENGTH + 1): continue
-            center = self._to_map((x, y))
-            if info["reason"] is None:
-                cv2.circle(panel, center, radius, self._color(info), -1, cv2.LINE_AA)
-                cv2.circle(panel, center, radius, (0, 0, 0), 1, cv2.LINE_AA)
-                text = str(info["cid"])
-                (tw, th), _ = cv2.getTextSize(text, FONT, 0.45, 1)
-                cv2.putText(panel, text, (center[0] - tw // 2, center[1] + th // 2), FONT, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
-            else:
-                cv2.circle(panel, center, radius, GRAY, 1, cv2.LINE_AA)
+        #mini-carte : trajectoires récentes, joueurs retenus (plein) et détections hors terrain (creux gris)
+        lines = [([m for _, m in self._recent(cid, frame_index)], PALETTE[cid % len(PALETTE)]) for cid in self.trails]
+        points = [(info["world"], self._color(info), str(info["cid"]) if info["reason"] is None else None)
+                  for info in infos if info["world"] is not None]
+        self._draw_map(panel, lines, points)
 
         #liste texte
-        y = self.text_top
-        def row(text, color, swatch=None):
-            nonlocal y
-            if y > self.ch - 6: return
-            if swatch is not None: cv2.rectangle(panel, (10, y - 10), (20, y), swatch, -1)
-            cv2.putText(panel, text, (28 if swatch is not None else 10, y), FONT, 0.5, color, 1, cv2.LINE_AA)
-            y += 20
-
+        row = self._text_rows(panel)
         used = sorted((i for i in infos if i["reason"] is None), key=lambda i: i["cid"])
         row("ON COURT  (#corrected id, raw tracker id)", (255, 255, 255))
         for i in used:
@@ -381,14 +367,84 @@ class DebugRenderer:
         if not used: row("none", GRAY)
         ignored = [i for i in infos if i["reason"] is not None]
         if ignored:
-            y += 6
+            row(None, None)
             row("IGNORED", (255, 255, 255))
             for i in ignored: row(f"raw {'-' if i['raw'] is None else i['raw']}: {REASONS[i['reason']]}", GRAY)
         past = [e for e in self.events if e[0] <= frame_index][-EVENTS_SHOWN:]
-        y += 6
+        row(None, None)
         row("RE-ASSOCIATIONS  (raw -> #id)", (255, 255, 255))
         for frame, raw, cid in past: row(f"frame {frame}: raw {raw} -> #{cid}", PALETTE[cid % len(PALETTE)])
         if not past: row("none yet", GRAY)
+        return panel
+
+    def _draw_map(self, panel, lines, points):
+        #lines : [(points mini-carte, couleur)] ; points : [((x, y) en m, couleur, texte)]
+        #texte None = rond creux (détection ignorée / position comblée), sinon rond plein avec l'id dedans
+        radius = max(5, int(0.35 * self.map_scale))
+        for line, color in lines:
+            if len(line) >= 2: cv2.polylines(panel, [np.array(line, np.int32)], False, color, 1, cv2.LINE_AA)
+        for (x, y), color, text in points:
+            if not (-1 <= x <= COURT_WIDTH + 1 and -1 <= y <= COURT_LENGTH + 1): continue
+            center = self._to_map((x, y))
+            if text is None:
+                cv2.circle(panel, center, radius, color, 1, cv2.LINE_AA)
+                continue
+            cv2.circle(panel, center, radius, color, -1, cv2.LINE_AA)
+            cv2.circle(panel, center, radius, (0, 0, 0), 1, cv2.LINE_AA)
+            (tw, th), _ = cv2.getTextSize(text, FONT, 0.45, 1)
+            cv2.putText(panel, text, (center[0] - tw // 2, center[1] + th // 2), FONT, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+
+    def _text_rows(self, panel):
+        #renvoie row(texte, couleur, pastille) qui écrit une ligne sous la mini-carte et descend ; row(None, None) = espace
+        y = self.text_top
+        def row(text, color, swatch=None):
+            nonlocal y
+            if text is None:
+                y += 6
+                return
+            if y > self.ch - 6: return
+            if swatch is not None: cv2.rectangle(panel, (10, y - 10), (20, y), swatch, -1)
+            cv2.putText(panel, text, (28 if swatch is not None else 10, y), FONT, 0.5, color, 1, cv2.LINE_AA)
+            y += 20
+        return row
+
+    #---------- panneau des trajectoires lissées ----------
+
+    def _build_smooth_trails(self, smooth, video_fps):
+        #par id : frames et points de la mini-carte, coupés en morceaux là où le lissage a coupé la trajectoire
+        per_id = {}
+        for frame in sorted(smooth):
+            for cid, x, y, *_ in smooth[frame]: per_id.setdefault(cid, []).append((frame, self._to_map((x, y))))
+        self.smooth_trails = {}
+        for cid, items in per_id.items():
+            frames = np.array([f for f, _ in items])
+            pts = np.array([m for _, m in items], np.int32)
+            cuts = np.flatnonzero(np.diff(frames) > MAX_GAP_S * video_fps) + 1
+            self.smooth_trails[cid] = list(zip(np.split(frames, cuts), np.split(pts, cuts)))
+
+    def _draw_smooth_panel(self, frame_index):
+        panel = self.panel_bg.copy()
+        limit = frame_index - self.trail_frames
+        lines = []
+        for cid, pieces in self.smooth_trails.items():
+            for frames, pts in pieces:
+                keep = (frames >= limit) & (frames <= frame_index)
+                if keep.any(): lines.append((pts[keep], PALETTE[cid % len(PALETTE)]))
+        players = sorted(self.smooth.get(frame_index, []))
+        points = [((x, y), PALETTE[cid % len(PALETTE)], str(cid) if observed else None)
+                  for cid, x, y, _, _, observed in players]
+        self._draw_map(panel, lines, points)
+
+        row = self._text_rows(panel)
+        row("SMOOTHED  (Kalman + RTS, per corrected id)", (255, 255, 255))
+        for cid, x, y, vx, vy, observed in players:
+            speed = 3.6 * math.hypot(vx, vy)
+            row(f"#{cid}  ({x:.1f},{y:.1f})m  {speed:4.1f} km/h{'' if observed else '  filled'}", (230, 230, 230),
+                PALETTE[cid % len(PALETTE)])
+        if not players: row("none", GRAY)
+        row(None, None)
+        row("hollow = no accepted measurement", GRAY)
+        row("  (gap filled or outlier rejected)", GRAY)
         return panel
 
 
@@ -398,6 +454,14 @@ def load_debug(out_dir):
         raise FileNotFoundError(f"{path} introuvable : detect_players doit être lancé avec debug=True")
     with open(path, "r") as fp:
         return {int(frame): dets for frame, dets in json.load(fp).items()}
+
+
+def load_smooth(out_dir):
+    #positions lissées (data_smooth.json, voir temporal_association/smooth_tracks.py) ; None si absentes
+    path = os.path.join(out_dir, "data_smooth.json")
+    if not os.path.exists(path): return None
+    with open(path, "r") as fp:
+        return {int(frame): players for frame, players in json.load(fp).items()}
 
 
 def reassociation_events(dico, mapping):
@@ -461,9 +525,11 @@ def render_debug_video(video_path, out_dir, calibration, mapping, fps, step=1, m
     sink = None
     try:
         size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        renderer = DebugRenderer(calibration, size, max_side, fps, mapping, reassociation_events(dico, mapping))
+        smooth = load_smooth(out_dir)
+        renderer = DebugRenderer(calibration, size, max_side, fps, mapping, reassociation_events(dico, mapping), smooth)
         #la vidéo de debug ne contient que les frames traitées : on la ralentit pour qu'elle reste en temps réel
-        sink = VideoSink(out_path, fps / max(step, 1), (renderer.cw + PANEL_W, renderer.ch))
+        panels = 1 if smooth is None else 2
+        sink = VideoSink(out_path, fps / max(step, 1), (renderer.cw + panels * PANEL_W, renderer.ch))
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, frames[0])
         state = {"index": frames[0]}
