@@ -109,7 +109,7 @@ def process_video(video, args):
     mapping = connect_players(out, fps=fps)
 
     #lisser les trajectoires par id corrigé (Kalman + RTS) -> data_smooth.json
-    smooth_tracks(out, fps=fps)
+    smooth_tracks(out, fps=fps, mapping=mapping)
 
     #vidéo de debug (détections + ids corrigés)
     if args.debug_video:

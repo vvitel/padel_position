@@ -12,7 +12,6 @@ from tqdm import tqdm
 from position_estimation.apply_homography import image_to_world, in_court, COURT_WIDTH, COURT_LENGTH
 from position_estimation.camera_functions.get_camera_parameters import get_camera_parameters
 from position_estimation.players_detection import KEYPOINT_CONF
-from temporal_association.smooth_tracks import MAX_GAP_S
 
 #vidéo de debug : la vidéo d'origine (distordue, non redressée) avec les lignes du terrain calculées reprojetées à
 #travers le fisheye, les détections (box, id corrigé, pieds), un panneau latéral (mini-carte + infos) avec les
@@ -82,7 +81,7 @@ class DebugRenderer:
         self.thick = 1 if self.fs < 0.8 else 2
         self._build_court_layer()
         self._build_panel_background()
-        if smooth is not None: self._build_smooth_trails(smooth, video_fps)
+        if smooth is not None: self._build_smooth_trails(smooth)
 
     #---------- construction (une seule fois par vidéo) ----------
 
@@ -378,8 +377,10 @@ class DebugRenderer:
 
     #---------- panneau des trajectoires lissées ----------
 
-    def _build_smooth_trails(self, smooth, video_fps):
+    def _build_smooth_trails(self, smooth):
         #par id : frames et points de la mini-carte, coupés en morceaux là où le lissage a coupé la trajectoire
+        #(l'id manque à une frame traitée de la grille = joueur sorti du court)
+        rank = {frame: i for i, frame in enumerate(sorted(smooth))}
         per_id = {}
         for frame in sorted(smooth):
             for cid, x, y, *_ in smooth[frame]: per_id.setdefault(cid, []).append((frame, self._to_map((x, y))))
@@ -387,7 +388,7 @@ class DebugRenderer:
         for cid, items in per_id.items():
             frames = np.array([f for f, _ in items])
             pts = np.array([m for _, m in items], np.int32)
-            cuts = np.flatnonzero(np.diff(frames) > MAX_GAP_S * video_fps) + 1
+            cuts = np.flatnonzero(np.diff([rank[f] for f in frames]) > 1) + 1
             self.smooth_trails[cid] = list(zip(np.split(frames, cuts), np.split(pts, cuts)))
 
     def _draw_smooth_panel(self, frame_index):
