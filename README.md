@@ -33,11 +33,11 @@ Résultats dans `outputs/<nom de la vidéo>/` (`--out_dir` pour changer) : `cali
 Le décodage, le rendu et l'encodage tournent en parallèle (~100 images/s en 1080p sur 16 coeurs). L'encodage est en H.264
 via `ffmpeg` s'il est dans le PATH (rapide, fichiers ~10x plus petits), sinon en `mp4v` via OpenCV (plus lent, plus gros).
 
-- **vue principale** : la vidéo redressée (sans distorsion) sur un canevas qui contient tout le terrain ; hors de la
-  vidéo d'origine (fond uni), seules les lignes du terrain calculées sont visibles (contour blanc, filet orange,
-  lignes de service cyan). Si elles ne recouvrent pas les lignes peintes, la calibration est à revoir.
-- **chaque détection** : contour de la box (redressé), id corrigé `#3` (avec `raw N` si l'id du tracker a été
-  réassocié), confiance, position en mètres, trajectoire des 2 dernières secondes.
+- **vue principale** : la vidéo d'origine (non redressée, avec sa distorsion) sur laquelle sont reprojetées, à travers
+  le fisheye, les lignes du terrain calculées (contour blanc dont la ligne du fond, filet orange, lignes de service
+  cyan). Si elles ne recouvrent pas les lignes peintes, la calibration est à revoir.
+- **chaque détection** : box telle que détectée, id corrigé en petit au-dessus (avec `raw N` si l'id du tracker a été
+  réassocié), trajectoire des 2 dernières secondes. La position en mètres est dans le panneau latéral.
 - **pieds** : rond plein = centre bas de la box ; carré = milieu des deux chevilles projeté au sol (croix verte = milieu,
   chevilles peu fiables en rond creux) ; losange = estimé depuis le nez (point magenta). Dans les deux derniers cas, le rond
   creux est le centre bas de la box qui aurait été pris sinon.

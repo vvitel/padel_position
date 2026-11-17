@@ -34,7 +34,7 @@ def parse_args():
     ap.add_argument("--pose_model", default="yolo26m-pose.pt", help="poids du modèle pose (.pt ou .engine)")
     ap.add_argument("--force_court", action="store_true", help="refaire la détection du court même si calibration.json existe")
     ap.add_argument("--debug_video", action="store_true",
-                    help="générer <out_dir>/<nom de la vidéo>/debug.mp4 : vidéo redressée, terrain entier, boxes, ids corrigés, pieds")
+                    help="générer <out_dir>/<nom de la vidéo>/debug.mp4 : vidéo d'origine + lignes du terrain, boxes, ids corrigés, pieds")
     ap.add_argument("--debug_max_side", type=int, default=1600, help="plus grand côté (px) de la vue principale de la vidéo de debug")
     return ap.parse_args()
 

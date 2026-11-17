@@ -11,13 +11,12 @@ import numpy as np
 from tqdm import tqdm
 from position_estimation.apply_homography import image_to_world, in_court, COURT_WIDTH, COURT_LENGTH
 from position_estimation.camera_functions.get_camera_parameters import get_camera_parameters
-from position_estimation.camera_functions.undistort_points import undistort_points
 from position_estimation.players_detection import KEYPOINT_CONF
 from temporal_association.smooth_tracks import MAX_GAP_S
 
-#vidéo de debug : la vidéo redressée (sans distorsion) sur un canevas qui contient tout le terrain, avec
-#les lignes du terrain calculées, les détections (box, id corrigé, pieds), un panneau latéral (mini-carte + infos)
-#avec les positions brutes, et un second panneau avec les trajectoires lissées (data_smooth.json)
+#vidéo de debug : la vidéo d'origine (distordue, non redressée) avec les lignes du terrain calculées reprojetées à
+#travers le fisheye, les détections (box, id corrigé, pieds), un panneau latéral (mini-carte + infos) avec les
+#positions brutes, et un second panneau avec les trajectoires lissées (data_smooth.json)
 
 #géométrie du terrain en mètres (normes FIP, voir padel-court-detector/padelcourt/court.py)
 NET_Y = COURT_LENGTH / 2
@@ -43,21 +42,18 @@ PALETTE = [tuple(c[::-1]) for c in [(230, 25, 75), (60, 180, 75), (255, 225, 25)
                                     (145, 30, 180), (70, 240, 240), (240, 50, 230), (210, 245, 60), (250, 190, 212),
                                     (0, 128, 128), (170, 110, 40)]]
 GRAY = (150, 150, 150)
-BACKGROUND = (38, 30, 26)
 
 #raison pour laquelle une détection n'est pas utilisée (status de data_debug.json, puis cas détectés ici)
 REASONS = {"no_crop": "no crop", "no_pose": "no pose", "no_nose": "no ankle/nose", "nose_failed": "nose ray failed",
            "off_court": "off court", "no_id": "no track id"}
 
-CANVAS_MARGIN = 0.04      #marge autour du terrain (fraction de sa taille à l'écran)
-FOOTPRINT_CLAMP = 0.6     #le fisheye étire énormément les bords de l'image : on borne l'empreinte à 60% autour du terrain
 PANEL_W = 440
 TRAIL_SECONDS = 2.0
 EVENTS_SHOWN = 6
 PREFETCH = 6              #frames lues d'avance / écrites en attente (décodage et encodage tournent pendant le rendu)
-PER_EDGE = 8              #points échantillonnés par côté d'une box (une box droite devient courbe une fois redressée)
-N_PERIM = 4 * PER_EDGE
-BOTTOM, NOSE, ANKLE_L, ANKLE_R = N_PERIM, N_PERIM + 1, N_PERIM + 2, N_PERIM + 3
+LINE_SAMPLES = 400        #points échantillonnés par ligne du terrain (une droite du terrain devient courbe dans l'image)
+BOTTOM, NOSE, ANKLE_L, ANKLE_R = 0, 1, 2, 3
+ID_SCALE = 0.75           #taille de l'id des box, relative au texte normal (étiquette discrète)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
@@ -84,7 +80,6 @@ class DebugRenderer:
         self._build_canvas(frame_size, max_side)
         self.fs = max(0.45, min(0.9, self.cw / 2200))
         self.thick = 1 if self.fs < 0.8 else 2
-        self._build_remap()
         self._build_court_layer()
         self._build_panel_background()
         if smooth is not None: self._build_smooth_trails(smooth, video_fps)
@@ -92,68 +87,46 @@ class DebugRenderer:
     #---------- construction (une seule fois par vidéo) ----------
 
     def _build_canvas(self, frame_size, max_side):
+        #le canevas est l'image d'origine (distordue), mise à l'échelle pour tenir dans max_side
         w_img, h_img = frame_size
-
-        #les 4 coins du terrain, y compris la partie basse hors de l'image d'origine
-        corners = np.array([[0, 0], [COURT_WIDTH, 0], [COURT_WIDTH, COURT_LENGTH], [0, COURT_LENGTH]], dtype=float)
-        court, w = _project(self.hom, corners)
-        if (w <= 1e-9).any():
-            raise RuntimeError("une partie du terrain est derrière la caméra : impossible de construire le canevas")
-        lo, hi = court.min(axis=0), court.max(axis=0)
-
-        #empreinte de l'image d'origine une fois redressée (bornée, voir FOOTPRINT_CLAMP)
-        t = np.linspace(0, 1, 60, endpoint=False)
-        zeros, w_ones, h_ones = np.zeros_like(t), np.full_like(t, w_img), np.full_like(t, h_img)
-        edge = np.vstack([np.c_[t * w_img, zeros], np.c_[w_ones, t * h_img],
-                          np.c_[w_img - t * w_img, h_ones], np.c_[zeros, h_img - t * h_img]])
-        footprint = undistort_points(edge, self.cam)
-        footprint = footprint[np.isfinite(footprint).all(axis=1)]
-        span = hi - lo
-        footprint = np.clip(footprint, lo - FOOTPRINT_CLAMP * span, hi + FOOTPRINT_CLAMP * span)
-        pts = np.vstack([court, footprint])
-        lo, hi = pts.min(axis=0), pts.max(axis=0)
-        pad = CANVAS_MARGIN * (hi - lo)
-        lo, hi = lo - pad, hi + pad
-
-        #le canevas est en pixels non distordus (les mêmes que l'homographie), mis à l'échelle pour tenir dans max_side
-        self.origin = lo
-        self.scale = min(1.0, max_side / float((hi - lo).max()))
-        self.cw, self.ch = (_even(v) for v in (hi - lo) * self.scale)
-
-    def _to_canvas(self, pts_undistorted):
-        return (np.asarray(pts_undistorted, dtype=float) - self.origin) * self.scale
-
-    def _build_remap(self):
-        f, cx, cy = self.cam["f"], self.cam["cx"], self.cam["cy"]
-        K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
-        D = np.array([self.cam["k"][0], self.cam["k"][1], 0.0, 0.0], dtype=np.float64)
-        #caméra idéale du canevas : même focale, décalée et mise à l'échelle comme le canevas
-        K_new = np.array([[f * self.scale, 0, (cx - self.origin[0]) * self.scale],
-                          [0, f * self.scale, (cy - self.origin[1]) * self.scale],
-                          [0, 0, 1]], dtype=np.float64)
-        self.map1, self.map2 = cv2.fisheye.initUndistortRectifyMap(K, D, np.eye(3), K_new, (self.cw, self.ch), cv2.CV_16SC2)
-
-        #le polynôme du fisheye n'est monotone que jusqu'à un certain angle : au-delà, la carte reboucle sur l'image
-        theta = np.linspace(0, math.pi / 2, 20000, endpoint=False)
-        theta_d = theta * (1 + D[0] * theta ** 2 + D[1] * theta ** 4)
-        bad = np.nonzero(np.diff(theta_d) <= 0)[0]
-        theta_valid = theta[bad[0]] if bad.size else theta[-1]
-        jj, ii = np.mgrid[0:self.ch, 0:self.cw].astype(np.float32)
-        radius = np.hypot(ii / self.scale + self.origin[0] - cx, jj / self.scale + self.origin[1] - cy)
-        valid = np.arctan(radius / f) <= theta_valid
-
-        #hors de la vidéo d'origine (ou au-delà de theta_valid) : coordonnée hors image, donc remap peint la couleur de
-        #bordure (le fond uni) sans masque ni addition par frame ; il n'y reste que les lignes du terrain
-        self.map1[~valid] = -30000
+        self.scale = min(1.0, max_side / float(max(w_img, h_img)))
+        self.cw, self.ch = _even(w_img * self.scale), _even(h_img * self.scale)
         self.img = np.empty((self.ch, self.cw, 3), np.uint8)
 
+        #le polynôme du fisheye n'est monotone que jusqu'à un certain angle : au-delà, la projection reboucle
+        k1, k2 = self.cam["k"]
+        theta = np.linspace(0, math.pi / 2, 20000, endpoint=False)
+        bad = np.nonzero(np.diff(theta * (1 + k1 * theta ** 2 + k2 * theta ** 4)) <= 0)[0]
+        self.theta_valid = theta[bad[0]] if bad.size else theta[-1]
+
+    def _to_canvas(self, pts_image):
+        #pixels de l'image d'origine -> pixels du canevas
+        return np.asarray(pts_image, dtype=float) * self.scale
+
+    def _distort(self, pts_undistorted):
+        #pixels non distordus (ceux de l'homographie) -> pixels de l'image d'origine ; NaN au-delà de theta_valid
+        f, cx, cy = self.cam["f"], self.cam["cx"], self.cam["cy"]
+        norm = (np.asarray(pts_undistorted, dtype=np.float64).reshape(-1, 2) - (cx, cy)) / f
+        K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+        D = np.array([*self.cam["k"], 0.0, 0.0], dtype=np.float64)
+        out = cv2.fisheye.distortPoints(norm.reshape(-1, 1, 2), K, D).reshape(-1, 2)
+        out[np.arctan(np.hypot(norm[:, 0], norm[:, 1])) > self.theta_valid] = np.nan
+        return out
+
     def _build_court_layer(self):
-        #lignes du terrain calculées (homographie), dessinées une fois pour toutes
+        #lignes du terrain calculées (homographie puis fisheye), dessinées une fois pour toutes ; une droite du terrain
+        #est courbe dans l'image distordue, on l'échantillonne donc finement
         self.lines = np.zeros((self.ch, self.cw, 3), np.uint8)
+        t = np.linspace(0, 1, LINE_SAMPLES)[:, None]
         for p1, p2, color, thickness in COURT_LINES:
-            a, b = self._to_canvas(_project(self.hom, [p1, p2])[0])
-            cv2.line(self.lines, tuple(np.round(a).astype(int)), tuple(np.round(b).astype(int)), color,
-                     thickness, cv2.LINE_AA)
+            p1, p2 = np.asarray(p1, float), np.asarray(p2, float)
+            und, w = _project(self.hom, p1 + t * (p2 - p1))
+            pts = self._to_canvas(self._distort(und))
+            ok = (w > 1e-9) & np.isfinite(pts).all(axis=1)
+            #une polyligne par morceau continu de points valides (derrière la caméra / hors du fisheye : coupé)
+            for run in np.split(np.arange(len(pts)), np.flatnonzero(np.diff(ok.astype(int))) + 1):
+                if ok[run[0]] and len(run) >= 2:
+                    cv2.polylines(self.lines, [np.rint(pts[run]).astype(np.int32)], False, color, thickness, cv2.LINE_AA)
         self.lines_idx = np.flatnonzero(self.lines.any(axis=2).ravel())
         self.lines_val = self.lines.reshape(-1, 3)[self.lines_idx]
 
@@ -176,12 +149,15 @@ class DebugRenderer:
     #---------- rendu d'une frame ----------
 
     def render(self, frame, frame_index, fps, dets):
-        img = cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR, dst=self.img, borderMode=cv2.BORDER_CONSTANT,
-                        borderValue=BACKGROUND)
+        if frame.shape[:2] == (self.ch, self.cw):
+            np.copyto(self.img, frame)
+            img = self.img
+        else:
+            img = cv2.resize(frame, (self.cw, self.ch), dst=self.img, interpolation=cv2.INTER_AREA)
         img.reshape(-1, 3)[self.lines_idx] = self.lines_val
 
         infos = [self._classify(d) for d in dets]
-        _, pts = self._sample_points(infos)
+        pts = self._sample_points(infos)
         self._update_trails(frame_index, infos)
         self._draw_trails(img, frame_index)
         for info, p in zip(infos, pts): self._draw_detection(img, info, p)
@@ -202,34 +178,31 @@ class DebugRenderer:
         return {"det": d, "raw": raw, "cid": cid, "world": world, "reason": reason}
 
     def _sample_points(self, infos):
-        #pour chaque détection : contour de la box + centre bas + nez + chevilles, redressés d'un seul appel
-        #retour : (n, N_PERIM + 4, 2) en pixels du canevas, et les mêmes en entiers pour le dessin
-        if not infos: return [], []
-        boxes = np.array([i["det"]["box"] for i in infos], dtype=float)
-        x1, y1, x2, y2 = (boxes[:, j, None] for j in range(4))
-        t = np.linspace(0, 1, PER_EDGE, endpoint=False)[None, :]
-        full = lambda v: np.broadcast_to(v, (len(boxes), PER_EDGE))
-        perimeter = np.concatenate([np.stack([x1 + (x2 - x1) * t, full(y1)], -1), np.stack([full(x2), y1 + (y2 - y1) * t], -1),
-                                    np.stack([x2 - (x2 - x1) * t, full(y2)], -1), np.stack([full(x1), y2 - (y2 - y1) * t], -1)], 1)
-        bottom = np.stack([(boxes[:, 0] + boxes[:, 2]) / 2, boxes[:, 3]], -1)
-        #keypoints absents : on retombe sur le centre bas (point jamais dessiné)
-        keypoints = np.repeat(bottom[:, None, :], 3, axis=1)
-        for n, info in enumerate(infos):
+        #pour chaque détection : centre bas de la box, nez, chevilles (image d'origine) en pixels entiers du canevas,
+        #et pied estimé (en pixels non distordus, donc redistordu) rangé dans info["foot_canvas"]
+        out = []
+        for info in infos:
             d = info["det"]
-            if d["nose"]: keypoints[n, 0] = d["nose"][:2]
-            for j, ankle in enumerate(d["ankles"] or []): keypoints[n, 1 + j] = ankle[:2]
-        pts = np.concatenate([perimeter, bottom[:, None, :], keypoints], 1)
-        canvas = self._to_canvas(undistort_points(pts.reshape(-1, 2), self.cam)).reshape(len(boxes), N_PERIM + 4, 2)
-        return canvas, np.rint(canvas).astype(np.int32).tolist()
+            x1, _, x2, y2 = d["box"]
+            bottom = ((x1 + x2) / 2, y2)
+            #keypoints absents : on retombe sur le centre bas (point jamais dessiné)
+            ankles = [a[:2] for a in d["ankles"] or []]
+            pts = [bottom, d["nose"][:2] if d["nose"] else bottom] + (ankles + [bottom, bottom])[:2]
+            info["foot_canvas"] = None
+            if d["foot"]:
+                foot = self._to_canvas(self._distort([d["foot"]]))[0]
+                if np.isfinite(foot).all(): info["foot_canvas"] = np.rint(foot).astype(np.int32)
+            out.append(np.rint(self._to_canvas(pts)).astype(np.int32).tolist())
+        return out
 
     def _color(self, info):
         return PALETTE[info["cid"] % len(PALETTE)] if info["reason"] is None else GRAY
 
     def _update_trails(self, frame_index, infos):
         for info in infos:
-            if info["reason"] is None:
+            if info["reason"] is None and info["foot_canvas"] is not None:
                 trail = self.trails.setdefault(info["cid"], deque(maxlen=int(self.trail_frames) + 1))
-                trail.append((frame_index, np.rint(self._to_canvas(info["det"]["foot"])).astype(np.int32), self._to_map(info["world"])))
+                trail.append((frame_index, info["foot_canvas"], self._to_map(info["world"])))
 
     def _recent(self, cid, frame_index):
         #(canevas, mini-carte) des points des TRAIL_SECONDS dernières secondes
@@ -247,9 +220,9 @@ class DebugRenderer:
         color = self._color(info)
         r = max(4, int(7 * self.fs))
 
-        #contour de la box (redressé)
-        perimeter = np.array(p[:N_PERIM], np.int32)
-        cv2.polylines(img, [perimeter], True, color, 2 if used else 1, cv2.LINE_AA)
+        #box telle que détectée dans l'image d'origine
+        x1, y1, x2, y2 = np.rint(self._to_canvas(d["box"])).astype(int).tolist()
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2 if used else 1, cv2.LINE_AA)
 
         #keypoints de la pose (quand le modèle pose a tourné) : nez en magenta, chevilles visibles en vert
         if d["nose"] and d["nose"][2] > KEYPOINT_CONF:
@@ -262,8 +235,8 @@ class DebugRenderer:
                 cv2.circle(img, tuple(p[idx]), max(3, r // 2), (0, 255, 0), 1, cv2.LINE_AA)
 
         #pieds tels qu'estimés par l'algorithme
-        if d["foot"]:
-            foot = tuple(np.rint(self._to_canvas(d["foot"])).astype(int).tolist())
+        if info["foot_canvas"] is not None:
+            foot = tuple(info["foot_canvas"].tolist())
             if d["method"] in ("nose", "ankles"):
                 #estimation par rayon depuis un keypoint, reliée à lui ; rond creux = centre bas de la box (non utilisé)
                 #nez : losange ; milieu des deux chevilles (croix verte) : carré
@@ -288,26 +261,21 @@ class DebugRenderer:
                 cv2.circle(img, foot, r, color, -1, cv2.LINE_AA)
                 cv2.circle(img, foot, r, (0, 0, 0), 1, cv2.LINE_AA)
 
-        #étiquette
-        conf = "" if d["conf"] is None else f"c{d['conf']:.2f}"
+        #étiquette discrète : id seul, petit, sans fond, juste au-dessus du coin haut gauche de la box
         if used:
-            raw = "" if info["raw"] == info["cid"] else f" (raw {info['raw']})"
-            x, y = info["world"]
-            lines = [(f"#{info['cid']}{raw}", color), (f"{conf} ({x:.1f},{y:.1f})m {d['method']}", (255, 255, 255))]
+            text = str(info["cid"]) if info["raw"] == info["cid"] else f"{info['cid']} (raw {info['raw']})"
         else:
-            raw = "-" if info["raw"] is None else info["raw"]
-            lines = [(f"raw {raw}: {REASONS[info['reason']]} {conf}", GRAY)]
-        self._draw_box_label(img, perimeter, lines)
+            text = f"{'-' if info['raw'] is None else info['raw']}: {REASONS[info['reason']]}"
+        self._small_label(img, text, (x1 + 1, y1 - 3), color)
 
-    def _draw_box_label(self, img, perimeter, lines):
-        (_, th), base = cv2.getTextSize("Ag", FONT, self.fs, self.thick)
-        lh = th + base + 4
-        x, top, bottom = int(perimeter[:, 0].min()), int(perimeter[:, 1].min()), int(perimeter[:, 1].max())
-        if top - lh * len(lines) - 2 >= 0:
-            ys = [top - 4 - lh * (len(lines) - 1 - i) for i in range(len(lines))]
-        else:
-            ys = [bottom + lh * (i + 1) for i in range(len(lines))]
-        for (text, color), y in zip(lines, ys): self._label(img, text, (x, y), color)
+    def _small_label(self, img, text, org, color):
+        #texte fin avec un liseré sombre (lisible sans rectangle de fond), recadré dans l'image
+        scale = self.fs * ID_SCALE
+        (tw, th), base = cv2.getTextSize(text, FONT, scale, 1)
+        x = int(min(max(org[0], 0), max(0, img.shape[1] - tw - 2)))
+        y = int(min(max(org[1], th + 2), img.shape[0] - base - 2))
+        cv2.putText(img, text, (x, y), FONT, scale, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(img, text, (x, y), FONT, scale, color, 1, cv2.LINE_AA)
 
     def _label(self, img, text, org, color, scale=None):
         #texte lisible sur n'importe quel fond (rectangle noir derrière), recadré dans l'image
@@ -335,7 +303,7 @@ class DebugRenderer:
                 ("foot = estimated from nose (hollow circle = bbox bottom)", "diamond"),
                 ("magenta = nose, green = ankles (hollow = low confidence)", None),
                 ("grey box = ignored detection (reason shown)", None),
-                ("#id = corrected id; raw = tracker id before re-association", None)]
+                ("box label = corrected id (raw = tracker id before re-association)", None)]
         y = img.shape[0] - 6
         for text, icon in reversed(rows):
             h = self._label(img, text, (6 + 3 * r, y), (255, 255, 255))
