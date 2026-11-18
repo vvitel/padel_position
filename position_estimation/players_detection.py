@@ -6,11 +6,9 @@ from ultralytics import YOLO
 from position_estimation.camera_functions.undistort_points import undistort_points
 from position_estimation.pose_functions.find_foot_with_nose import camera_pose_from_homography, find_foot_with_nose
 
-#hauteur du nez (m) pour un joueur de 1,75 m
-NOSE_HEIGHT = 1.63
 #hauteur des chevilles (m) au-dessus du sol
 ANKLE_HEIGHT = 0.08
-#confiance minimale pour considérer un keypoint comme visible
+#confiance minimale pour afficher un keypoint comme visible (vidéo de debug)
 KEYPOINT_CONF = 0.5
 #taille d'entrée du modèle box (doit correspondre à l'export TensorRT si un .engine est utilisé)
 BOX_IMGSZ = 960
@@ -113,38 +111,15 @@ def _positions_in_frame(frame, boxes, model_pose, pose_imgsz, half, cam, R, C, H
             rec["nose"] = [float(kp[0, 0]) + int(x1), float(kp[0, 1]) + int(y1), float(kp[0, 2])]
             rec["ankles"] = [[float(kp[j, 0]) + int(x1), float(kp[j, 1]) + int(y1), float(kp[j, 2])] for j in (15, 16)]
 
-            #si au moins une cheville est visible : pieds = projection au sol du milieu des deux chevilles
-            #(même si l'une des deux est peu fiable) ; si le rayon échoue, on garde le centre bas de la box
-            if kp[15, 2] > KEYPOINT_CONF or kp[16, 2] > KEYPOINT_CONF:
-                x_ankle = (rec["ankles"][0][0] + rec["ankles"][1][0]) / 2
-                y_ankle = (rec["ankles"][0][1] + rec["ankles"][1][1]) / 2
-                ankle_undistorted = undistort_points([[x_ankle, y_ankle]], cam)
-                x_ankle_undistorted, y_ankle_undistorted = ankle_undistorted[0]
-                foot = find_foot_with_nose(x_ankle_undistorted, y_ankle_undistorted, R, C, H, f, cx, cy, ANKLE_HEIGHT)
-                if foot is not None:
-                    rec["method"], rec["foot"] = "ankles", list(foot)
-                    dic_pos_frame[cpt] = {"id": track_id,
-                                          "position": list(foot)}
-                    cpt += 1
-                    continue
-
-            #si aucune cheville n'est visible, estimer les pieds à partir du nez
-            #(sinon on garde le centre bas de la box, traité plus bas)
-            if not (kp[15, 2] > KEYPOINT_CONF or kp[16, 2] > KEYPOINT_CONF):
-                #récupérer le point du nez
-                if kp[0, 2] <= KEYPOINT_CONF:
-                    rec["status"] = "no_nose"
-                    continue
-                #repasser des coordonnées du crop à celles de l'image
-                x_nose, y_nose = float(kp[0, 0]) + int(x1), float(kp[0, 1]) + int(y1)
-                nose_undistorted = undistort_points([[x_nose, y_nose]], cam)
-                x_nose_undistorted, y_nose_undistorted = nose_undistorted[0]
-                #estimer position des pieds (en pixels non distordus)
-                foot = find_foot_with_nose(x_nose_undistorted, y_nose_undistorted, R, C, H, f, cx, cy, NOSE_HEIGHT)
-                if foot is None:
-                    rec["status"] = "nose_failed"
-                    continue
-                rec["method"], rec["foot"] = "nose", list(foot)
+            #pieds = projection au sol du milieu des deux chevilles, quelle que soit leur confiance
+            #(le modèle les place même hors champ ou peu visibles) ; si le rayon échoue, on garde le centre bas de la box
+            x_ankle = (rec["ankles"][0][0] + rec["ankles"][1][0]) / 2
+            y_ankle = (rec["ankles"][0][1] + rec["ankles"][1][1]) / 2
+            ankle_undistorted = undistort_points([[x_ankle, y_ankle]], cam)
+            x_ankle_undistorted, y_ankle_undistorted = ankle_undistorted[0]
+            foot = find_foot_with_nose(x_ankle_undistorted, y_ankle_undistorted, R, C, H, f, cx, cy, ANKLE_HEIGHT)
+            if foot is not None:
+                rec["method"], rec["foot"] = "ankles", list(foot)
                 dic_pos_frame[cpt] = {"id": track_id,
                                       "position": list(foot)}
                 cpt += 1

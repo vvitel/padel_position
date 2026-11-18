@@ -160,7 +160,6 @@ class DebugRenderer:
         self._update_trails(frame_index, infos)
         self._draw_trails(img, frame_index)
         for info, p in zip(infos, pts): self._draw_detection(img, info, p)
-        self._draw_legend(img)
         self._draw_hud(img, frame_index, fps, infos)
         panels = [img, self._draw_panel(frame_index, infos)]
         if self.smooth is not None: panels.append(self._draw_smooth_panel(frame_index))
@@ -295,26 +294,6 @@ class DebugRenderer:
         if len(set(cids)) != len(cids): text += "  DUPLICATE ID"
         self._label(img, text, (6, int(28 * self.fs) + 6), (80, 80, 255) if problem else (255, 255, 255), self.fs * 1.1)
 
-    def _draw_legend(self, img):
-        r = max(4, int(7 * self.fs))
-        rows = [("foot = bbox bottom-centre", "circle"),
-                ("foot = ground projection of ankles midpoint (cross)", "square"),
-                ("foot = estimated from nose (hollow circle = bbox bottom)", "diamond"),
-                ("magenta = nose, green = ankles (hollow = low confidence)", None),
-                ("grey box = ignored detection (reason shown)", None),
-                ("box label = corrected id (raw = tracker id before re-association)", None)]
-        y = img.shape[0] - 6
-        for text, icon in reversed(rows):
-            h = self._label(img, text, (6 + 3 * r, y), (255, 255, 255))
-            cy = y - h // 2 + 2
-            if icon == "circle": cv2.circle(img, (6 + r, cy), r, (255, 255, 255), -1, cv2.LINE_AA)
-            if icon == "square":
-                cv2.rectangle(img, (6, cy - r + 1), (6 + 2 * r, cy + r - 1), (255, 255, 255), -1)
-            if icon == "diamond":
-                cv2.fillConvexPoly(img, np.array([[6 + r, cy - r], [6 + 2 * r, cy], [6 + r, cy + r], [6, cy]], np.int32),
-                                   (255, 255, 255), cv2.LINE_AA)
-            y -= h
-
     def _draw_panel(self, frame_index, infos):
         panel = self.panel_bg.copy()
 
@@ -346,7 +325,7 @@ class DebugRenderer:
 
     def _draw_map(self, panel, lines, points):
         #lines : [(points mini-carte, couleur)] ; points : [((x, y) en m, couleur, texte)]
-        #texte None = rond creux (détection ignorée / position comblée), sinon rond plein avec l'id dedans
+        #texte None = rond creux (détection ignorée), sinon rond plein avec l'id dedans
         radius = max(5, int(0.35 * self.map_scale))
         for line, color in lines:
             if len(line) >= 2: cv2.polylines(panel, [np.array(line, np.int32)], False, color, 1, cv2.LINE_AA)
@@ -400,8 +379,7 @@ class DebugRenderer:
                 keep = (frames >= limit) & (frames <= frame_index)
                 if keep.any(): lines.append((pts[keep], PALETTE[cid % len(PALETTE)]))
         players = sorted(self.smooth.get(frame_index, []))
-        points = [((x, y), PALETTE[cid % len(PALETTE)], str(cid) if observed else None)
-                  for cid, x, y, _, _, observed in players]
+        points = [((x, y), PALETTE[cid % len(PALETTE)], str(cid)) for cid, x, y, *_ in players]
         self._draw_map(panel, lines, points)
 
         row = self._text_rows(panel)
@@ -411,9 +389,6 @@ class DebugRenderer:
             row(f"#{cid}  ({x:.1f},{y:.1f})m  {speed:4.1f} km/h{'' if observed else '  filled'}", (230, 230, 230),
                 PALETTE[cid % len(PALETTE)])
         if not players: row("none", GRAY)
-        row(None, None)
-        row("hollow = no accepted measurement", GRAY)
-        row("  (gap filled or outlier rejected)", GRAY)
         return panel
 
 
